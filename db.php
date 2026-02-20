@@ -455,6 +455,7 @@ HTML;
             $this->appendToWal($table, $html);
             $this->incrementMeta($table, 'total_rows', 1);
             $this->incrementMeta($table, 'wal_entries', 1);
+            $this->maybeCompact($table);
             return 1;
         }
 
@@ -479,6 +480,7 @@ HTML;
                 $this->appendToWal($table, $html);
                 $this->incrementMeta($table, 'wal_entries', count($rows));
                 $this->incrementMeta($table, 'total_rows', count($rows));
+                $this->maybeCompact($table);
             }
             return count($rows);
         }
@@ -514,6 +516,7 @@ HTML;
             if ($html !== '') {
                 $this->appendToWal($table, $html);
                 $this->incrementMeta($table, 'wal_entries', count($matchingRows));
+                $this->maybeCompact($table);
             }
 
             return count($matchingRows);
@@ -544,6 +547,7 @@ HTML;
                 $this->appendToWal($table, $html);
                 $this->incrementMeta($table, 'wal_entries', count($matchingRows));
                 $this->incrementMeta($table, 'total_rows', -count($matchingRows));
+                $this->maybeCompact($table);
             }
 
             return count($matchingRows);
@@ -773,6 +777,16 @@ HTML;
                     }
                 }
 
+                // Pre-calculate total chunks that will exist after compaction
+                $existingChunks = $this->router->listChunks($tableDir);
+                $allChunkNames = array_unique(array_merge($existingChunks, array_keys($chunkUpdates)));
+                if (!empty($allInserts)) {
+                    $allChunkNames[] = 'chunk_0001.html';
+                    $allChunkNames = array_unique($allChunkNames);
+                }
+                sort($allChunkNames);
+                $totalChunksKnown = count($allChunkNames);
+
                 // Step 4: Update each affected chunk
                 foreach ($chunkUpdates as $chunkFile => $entries) {
                     $chunkPath = $tableDir . '/' . $chunkFile;
@@ -802,7 +816,7 @@ HTML;
                     }
 
                     // Write chunk (crash-safe: temp + rename)
-                    $this->writeChunkFile($table, $chunkFile, array_values($rowsByPk));
+                    $this->writeChunkFile($table, $chunkFile, array_values($rowsByPk), $totalChunksKnown);
                 }
 
                 // Step 5: Handle inserts without PK into appropriate chunks
@@ -813,7 +827,7 @@ HTML;
                         $chunkPath = $tableDir . '/' . $chunkFile;
                         $existing = file_exists($chunkPath) ? $this->parseHtmlRows($chunkPath) : [];
                         $existing[] = ['data' => $entry['data'], 'tx' => $entry['tx']];
-                        $this->writeChunkFile($table, $chunkFile, $existing);
+                        $this->writeChunkFile($table, $chunkFile, $existing, $totalChunksKnown);
                     }
                 }
 
@@ -1085,7 +1099,7 @@ HTML;
         /**
          * Write a chunk file with styled HTML page (crash-safe: temp + rename).
          */
-        private function writeChunkFile(string $table, string $chunkFile, array $rows): void
+        private function writeChunkFile(string $table, string $chunkFile, array $rows, ?int $knownTotalChunks = null): void
         {
             $tableDir = $this->router->tableDir($table);
             $targetPath = $tableDir . '/' . $chunkFile;
@@ -1106,13 +1120,17 @@ HTML;
             $chunkNum  = (int) ($cm[1] ?? 1);
             $range     = $this->router->chunkRange($chunkFile);
 
-            // Count total chunks
-            $allChunks = $this->router->listChunks($tableDir);
-            if (!in_array($chunkFile, $allChunks, true)) {
-                $allChunks[] = $chunkFile;
-                sort($allChunks);
+            // Use provided total or detect from disk
+            if ($knownTotalChunks !== null) {
+                $totalChunks = $knownTotalChunks;
+            } else {
+                $allChunks = $this->router->listChunks($tableDir);
+                if (!in_array($chunkFile, $allChunks, true)) {
+                    $allChunks[] = $chunkFile;
+                    sort($allChunks);
+                }
+                $totalChunks = count($allChunks);
             }
-            $totalChunks = count($allChunks);
 
             // Count approximate total rows
             $totalRows = count($rows) * $totalChunks; // rough estimate
@@ -1140,12 +1158,24 @@ HTML;
         {
             $tableDir = $this->router->tableDir($table);
             $chunks   = $this->router->listChunks($tableDir);
+            $totalChunks = count($chunks);
 
-            // Count total rows
+            // Count total rows and re-stamp chunk navigation
             $totalRows = 0;
+            $chunkRowCounts = [];
             foreach ($chunks as $chunkFile) {
                 $rows = $this->parseHtmlRows($tableDir . '/' . $chunkFile);
                 $totalRows += count($rows);
+                $chunkRowCounts[$chunkFile] = count($rows);
+            }
+
+            // Re-stamp all chunk files with correct navigation links
+            foreach ($chunks as $chunkFile) {
+                $chunkPath = $tableDir . '/' . $chunkFile;
+                $rows = $this->parseHtmlRows($chunkPath);
+                if (!empty($rows)) {
+                    $this->writeChunkFile($table, $chunkFile, $rows, $totalChunks);
+                }
             }
 
             // Count WAL entries
@@ -1179,6 +1209,31 @@ HTML;
             $tmpIndex  = $indexPath . '.tmp';
             file_put_contents($tmpIndex, $indexHtml);
             rename($tmpIndex, $indexPath);
+
+            // Rebuild root database _index.html
+            $this->rebuildDatabaseIndex();
+        }
+
+        /**
+         * Rebuild the root html_db/_index.html listing all tables.
+         */
+        private function rebuildDatabaseIndex(): void
+        {
+            $allTables = $this->listTables();
+            $tableInfos = [];
+            foreach ($allTables as $tbl) {
+                $meta = $this->readMeta($tbl);
+                $tableInfos[] = [
+                    'name'   => $tbl,
+                    'rows'   => $meta['total_rows'] ?? 0,
+                    'chunks' => $meta['chunks'] ?? 0,
+                ];
+            }
+            $html = $this->pageBuilder->buildDatabaseIndex($tableInfos);
+            $path = rtrim($this->config->basePath, '/') . '/_index.html';
+            $tmp  = $path . '.tmp';
+            file_put_contents($tmp, $html);
+            rename($tmp, $path);
         }
 
         /**
