@@ -176,17 +176,32 @@ namespace HtmlDatabase\Core {
         }
 
         /**
-         * Ensure the table directory exists with security files.
+         * Path to the persisted _schema.json for a table (created from
+         * CREATE TABLE / ALTER TABLE statements).
          */
-        public function ensureTableDir(string $table): string
+        public function schemaPath(string $table): string
+        {
+            return $this->tableDir($table) . '/_schema.json';
+        }
+
+        /**
+         * Ensure the table directory exists with security files.
+         *
+         * Returns true when the browsable _index.html is missing (freshly
+         * created directory, or an older install predating index pages), so
+         * callers can regenerate it. Without this, WAL/chunk pages link to a
+         * 404 until the table happens to be compacted.
+         */
+        public function ensureTableDir(string $table): bool
         {
             $dir = $this->tableDir($table);
             if (!is_dir($dir)) {
                 mkdir($dir, 0755, true);
                 // Create security index.html in the table directory
                 $this->writeSecurityIndex($dir, $table);
+                return true;
             }
-            return $dir;
+            return !file_exists($dir . '/_index.html');
         }
 
         /**
@@ -309,7 +324,7 @@ HTML;
 <body>
   <header>
     <h1>📀 {$table}</h1>
-    <nav><a href="../_index.html">⌂ Database</a></nav>
+    <nav><a href="../_index.html">⌂ Database</a> | <a href="wal.html">📝 WAL</a></nav>
   </header>
   <div class="stats">
     <p>Total rows: <strong>{$totalRows}</strong> | WAL pending: <strong>{$walPending}</strong> | Chunk size: <strong>{$this->config->chunkSize}</strong></p>
@@ -431,6 +446,9 @@ HTML;
         /** In-memory cache of table metadata (per-request). */
         private array $metaCache = [];
 
+        /** In-memory cache of table schemas (per-request). */
+        private array $schemaCache = [];
+
         public function __construct(private Configuration $config)
         {
             $this->router      = new ShardRouter($config);
@@ -443,6 +461,35 @@ HTML;
             return $this->router;
         }
 
+        /**
+         * Ensure a table directory exists and its browsable _index.html is
+         * present. Fresh or legacy directories get an initial index page
+         * immediately, so WAL/chunk navigation never 404s before the first
+         * compaction.
+         */
+        private function ensureTable(string $table): void
+        {
+            if (!$this->router->ensureTableDir($table)) {
+                return;
+            }
+            $meta      = $this->readMeta($table);
+            $tableDir  = $this->router->tableDir($table);
+            $chunks    = $this->router->listChunks($tableDir);
+            $indexHtml = $this->pageBuilder->buildIndexPage(
+                $table,
+                $chunks,
+                (int) ($meta['total_rows'] ?? 0),
+                (int) ($meta['wal_entries'] ?? 0)
+            );
+            $indexPath = $tableDir . '/_index.html';
+            $tmp       = $indexPath . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
+            file_put_contents($tmp, $indexHtml, LOCK_EX);
+            rename($tmp, $indexPath);
+            // New table must appear in the root database index immediately,
+            // not only after its first compaction.
+            $this->rebuildDatabaseIndex();
+        }
+
         // -- INSERT -----------------------------------------------------------
 
         /**
@@ -450,7 +497,7 @@ HTML;
          */
         public function insert(string $table, array $payload, int $txId): int
         {
-            $this->router->ensureTableDir($table);
+            $this->ensureTable($table);
             $html = $this->buildWalEntry($payload, 'insert', $txId, $this->extractPkFromPayload($table, $payload));
             $this->appendToWal($table, $html);
             $this->incrementMeta($table, 'total_rows', 1);
@@ -464,7 +511,7 @@ HTML;
          */
         public function insertBatch(string $table, array $columns, array $rows, int $txId): int
         {
-            $this->router->ensureTableDir($table);
+            $this->ensureTable($table);
             $colCount = count($columns);
             $html = '';
             foreach ($rows as $ri => $values) {
@@ -493,7 +540,7 @@ HTML;
          */
         public function updateRows(string $table, array $setValues, array $conditions, int $txId): int
         {
-            $this->router->ensureTableDir($table);
+            $this->ensureTable($table);
 
             // We need to find matching rows to know which PKs to update.
             // Read from chunks + WAL, apply conditions, get PKs.
@@ -539,7 +586,7 @@ HTML;
          */
         public function deleteRows(string $table, array $conditions, int $txId): int
         {
-            $this->router->ensureTableDir($table);
+            $this->ensureTable($table);
             $matchingRows = $this->findMatchingRows($table, $conditions);
 
             if (empty($matchingRows)) {
@@ -689,6 +736,18 @@ HTML;
                         if (!$ok) { $match = false; break; }
                         continue;
                     }
+                    if (is_array($val) && isset($val['__between__'])) {
+                        $dv = $data[$col] ?? '';
+                        $bt = $val['__between__'];
+                        if (is_numeric($dv) && is_numeric($bt['low']) && is_numeric($bt['high'])) {
+                            $ok = (float) $dv >= (float) $bt['low'] && (float) $dv <= (float) $bt['high'];
+                        } else {
+                            $ok = (string) $dv >= (string) $bt['low'] && (string) $dv <= (string) $bt['high'];
+                        }
+                        if ($bt['not']) $ok = !$ok;
+                        if (!$ok) { $match = false; break; }
+                        continue;
+                    }
                     if (!array_key_exists($col, $data) || (string) $data[$col] !== (string) $val) {
                         $match = false;
                         break;
@@ -779,6 +838,7 @@ HTML;
             }
             @rmdir($dir);
             unset($this->metaCache[$table]);
+            unset($this->schemaCache[$table]);
         }
 
         /**
@@ -811,12 +871,17 @@ HTML;
         }
 
         /**
-         * Column names of a table, sampled from stored rows.
+         * Column names of a table. Persisted schema (from CREATE TABLE) is
+         * authoritative; otherwise sampled from stored rows.
          *
          * @return string[]
          */
         public function listColumns(string $table): array
         {
+            $schema = $this->readSchema($table);
+            if ($schema !== null && !empty($schema['columns'])) {
+                return array_keys($schema['columns']);
+            }
             $rows = $this->readRows($table);
             foreach ($rows as $row) {
                 if (!empty($row['data'])) {
@@ -824,6 +889,45 @@ HTML;
                 }
             }
             return [];
+        }
+
+        /**
+         * Read the persisted _schema.json for a table (cached per-request).
+         * Returns null when no schema has been recorded (core tables created
+         * before schema persistence, or implicit tables).
+         *
+         * @return array{pk:?string,auto:?string,columns:array<string,array>,defaults:array<string,string>}|null
+         */
+        public function readSchema(string $table): ?array
+        {
+            if (array_key_exists($table, $this->schemaCache)) {
+                return $this->schemaCache[$table];
+            }
+            $path = $this->router->schemaPath($table);
+            if (file_exists($path)) {
+                $decoded = json_decode((string) @file_get_contents($path), true);
+                if (is_array($decoded) && isset($decoded['columns'])) {
+                    $decoded += ['pk' => null, 'auto' => null, 'defaults' => []];
+                    $this->schemaCache[$table] = $decoded;
+                    return $decoded;
+                }
+            }
+            $this->schemaCache[$table] = null;
+            return null;
+        }
+
+        /**
+         * Persist a table schema to _schema.json (crash-safe temp + rename).
+         */
+        public function writeSchema(string $table, array $schema): void
+        {
+            $this->ensureTable($table);
+            $schema += ['pk' => null, 'auto' => null, 'columns' => [], 'defaults' => []];
+            $path = $this->router->schemaPath($table);
+            $tmp  = $path . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
+            @file_put_contents($tmp, json_encode($schema, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX);
+            @rename($tmp, $path);
+            $this->schemaCache[$table] = $schema;
         }
 
         // -- Auto-increment ---------------------------------------------------
@@ -834,7 +938,7 @@ HTML;
          */
         public function nextAutoIncrement(string $table): int
         {
-            $this->router->ensureTableDir($table);
+            $this->ensureTable($table);
             $seqPath = $this->router->seqPath($table);
 
             $file = new SplFileObject($seqPath, 'c+');
@@ -860,7 +964,7 @@ HTML;
          */
         public function advanceSequence(string $table, int $pk): void
         {
-            $this->router->ensureTableDir($table);
+            $this->ensureTable($table);
             $seqPath = $this->router->seqPath($table);
 
             $file = new SplFileObject($seqPath, 'c+');
@@ -1292,10 +1396,16 @@ HTML;
         }
 
         /**
-         * Resolve the PK column for a table.
+         * Resolve the PK column for a table. Persisted schema (from
+         * CREATE TABLE) wins; core tables fall back to the static map.
          */
         public function resolvePkColumn(string $table): ?string
         {
+            $schema = $this->readSchema($table);
+            if ($schema !== null) {
+                return isset($schema['pk']) && $schema['pk'] !== '' ? (string) $schema['pk'] : null;
+            }
+
             static $pkMap = [
                 'users'              => 'ID',
                 'usermeta'           => 'umeta_id',
@@ -1451,8 +1561,8 @@ HTML;
             }
             $html = $this->pageBuilder->buildDatabaseIndex($tableInfos);
             $path = rtrim($this->config->basePath, '/') . '/_index.html';
-            $tmp  = $path . '.tmp';
-            file_put_contents($tmp, $html);
+            $tmp  = $path . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
+            file_put_contents($tmp, $html, LOCK_EX);
             rename($tmp, $path);
         }
 
@@ -1505,6 +1615,21 @@ HTML;
             @file_put_contents($tmpMeta, json_encode($meta, JSON_PRETTY_PRINT));
             @rename($tmpMeta, $metaPath);
             $this->metaCache[$table] = $meta;
+
+            // Keep the browsable index page in sync with live counts while we
+            // still hold the meta lock (chunk list only changes at compaction,
+            // row/WAL counters change on every mutation).
+            $chunks      = $this->router->listChunks($this->router->tableDir($table));
+            $indexHtml   = $this->pageBuilder->buildIndexPage(
+                $table,
+                $chunks,
+                (int) ($meta['total_rows'] ?? 0),
+                (int) ($meta['wal_entries'] ?? 0)
+            );
+            $indexPath = $this->router->tableDir($table) . '/_index.html';
+            $tmpIndex  = $indexPath . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
+            @file_put_contents($tmpIndex, $indexHtml, LOCK_EX);
+            @rename($tmpIndex, $indexPath);
 
             if ($lf) {
                 flock($lf, LOCK_UN);
@@ -1929,6 +2054,7 @@ namespace HtmlDatabase\Parser {
             $len   = strlen($sql);
             $depth = 0;
             $inStr = false;
+            $strCh = '';
             $esc   = false;
             $start = null;
 
@@ -1936,12 +2062,16 @@ namespace HtmlDatabase\Parser {
                 $ch = $sql[$i];
                 if ($esc) { $esc = false; continue; }
                 if ($ch === '\\') { $esc = true; continue; }
-                if ($ch === "'" && !$esc) {
-                    if ($inStr && isset($sql[$i + 1]) && $sql[$i + 1] === "'") { $i++; continue; }
-                    $inStr = !$inStr;
+                if (($ch === "'" || $ch === '"') && !$inStr) {
+                    $inStr = true; $strCh = $ch; continue;
+                }
+                if ($inStr) {
+                    if ($ch === $strCh) {
+                        if (isset($sql[$i + 1]) && $sql[$i + 1] === $strCh) { $i++; continue; }
+                        $inStr = false;
+                    }
                     continue;
                 }
-                if ($inStr) continue;
                 if ($ch === '(') {
                     if ($depth === 0) $start = $i + 1;
                     $depth++;
@@ -1960,6 +2090,7 @@ namespace HtmlDatabase\Parser {
             $values = [];
             $buf    = '';
             $inStr  = false;
+            $strCh  = '';
             $esc    = false;
             $depth  = 0;
             $len    = strlen($raw);
@@ -1968,16 +2099,21 @@ namespace HtmlDatabase\Parser {
                 $ch = $raw[$i];
                 if ($esc) { $buf .= $ch; $esc = false; continue; }
                 if ($ch === '\\') { $esc = true; if ($inStr) $buf .= $ch; continue; }
-                if ($ch === "'" && !$esc) {
-                    if ($inStr && isset($raw[$i + 1]) && $raw[$i + 1] === "'") { $buf .= "'"; $i++; continue; }
-                    $inStr = !$inStr;
+                if (($ch === "'" || $ch === '"') && !$inStr) {
+                    $inStr = true; $strCh = $ch; continue;
+                }
+                if ($inStr) {
+                    if ($ch === $strCh) {
+                        if (isset($raw[$i + 1]) && $raw[$i + 1] === $strCh) { $buf .= $ch; $i++; continue; }
+                        $inStr = false; $strCh = '';
+                        continue;
+                    }
+                    $buf .= $ch;
                     continue;
                 }
-                if (!$inStr) {
-                    if ($ch === '(') { $depth++; $buf .= $ch; continue; }
-                    if ($ch === ')') { $depth--; $buf .= $ch; continue; }
-                    if ($ch === ',' && $depth === 0) { $values[] = $this->cleanValue($buf); $buf = ''; continue; }
-                }
+                if ($ch === '(') { $depth++; $buf .= $ch; continue; }
+                if ($ch === ')') { $depth--; $buf .= $ch; continue; }
+                if ($ch === ',' && $depth === 0) { $values[] = $this->cleanValue($buf); $buf = ''; continue; }
                 $buf .= $ch;
             }
             $values[] = $this->cleanValue($buf);
@@ -1988,7 +2124,7 @@ namespace HtmlDatabase\Parser {
         {
             $v = trim($v);
             if (strcasecmp($v, 'NULL') === 0) return '';
-            if (preg_match('/^(NOW|CURRENT_TIMESTAMP|CURRENT_DATE|CURDATE)\(*$/i', $v)) {
+            if (preg_match('/^(NOW|CURRENT_TIMESTAMP|CURRENT_DATE|CURDATE)\s*(\(\s*\))?$/i', $v)) {
                 return gmdate('Y-m-d H:i:s');
             }
             if (preg_match('/^UNIX_TIMESTAMP\(\)$/i', $v)) {
@@ -2254,7 +2390,7 @@ namespace HtmlDatabase\Parser {
             // Aggregates (per-group when GROUP BY is present, else global)
             $aggregates = [];
             if (preg_match_all(
-                '/\b(COUNT|MAX|MIN|SUM|AVG)\s*\(\s*(DISTINCT\s+)?(\*|[a-zA-Z0-9_]+)\s*\)(?:\s+AS\s+([a-zA-Z0-9_]+))?/i',
+                '/\b(COUNT|MAX|MIN|SUM|AVG)\s*\(\s*(DISTINCT\s+)?(\*|[a-zA-Z0-9_]+)\s*\)(?:\s+(?:AS\s+)?([a-zA-Z0-9_]+))?/i',
                 $rawCols, $agm, PREG_SET_ORDER)) {
                 foreach ($agm as $ag) {
                     $aggregates[] = [
@@ -2322,6 +2458,7 @@ namespace HtmlDatabase\Parser {
             $notLikeConditions = [];
             $nullConditions   = [];
             $notNullConditions = [];
+            $betweenConditions = []; // [ ['col'=>..,'not'=>bool,'low'=>..,'high'=>..], ... ]
             $orGroups         = []; // list of disjunctions: [ [cond, cond...], ... ]
 
             if ($rawWhere !== null) {
@@ -2462,6 +2599,17 @@ namespace HtmlDatabase\Parser {
                         continue;
                     }
 
+                    // col [NOT] BETWEEN a AND b
+                    if (preg_match('/^([a-zA-Z0-9_]+)\s+(NOT\s+)?BETWEEN\s+(\'[^\']*\'|"[^"]*"|-?\d+(?:\.\d+)?)\s+AND\s+(\'[^\']*\'|"[^"]*"|-?\d+(?:\.\d+)?)$/is', $part, $bt)) {
+                        $betweenConditions[] = [
+                            'col'  => $bt[1],
+                            'not'  => !empty($bt[2]),
+                            'low'  => trim($bt[3], "'\""),
+                            'high' => trim($bt[4], "'\""),
+                        ];
+                        continue;
+                    }
+
                     // col >= N, col <= N, col > N, col < N (numeric)
                     if (preg_match('/^([a-zA-Z0-9_]+)\s*(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)$/s', $part, $cmp)) {
                         $comparisons[] = ['col' => $cmp[1], 'op' => $cmp[2], 'val' => $cmp[3]];
@@ -2488,6 +2636,7 @@ namespace HtmlDatabase\Parser {
                 'notLikeConditions' => $notLikeConditions,
                 'nullConditions'    => $nullConditions,
                 'notNullConditions' => $notNullConditions,
+                'betweenConditions' => $betweenConditions,
                 'orGroups'          => $orGroups,
                 'joins'             => $joins,
                 'joinFilters'       => $joinFilters,
@@ -2595,6 +2744,9 @@ namespace HtmlDatabase\Parser {
             $depth  = 0;
             $len    = strlen($where);
             $i      = 0;
+            // BETWEEN x AND y: the AND belongs to BETWEEN, not to the
+            // condition splitter.
+            $inBetween = false;
 
             while ($i < $len) {
                 $ch = $where[$i];
@@ -2618,6 +2770,19 @@ namespace HtmlDatabase\Parser {
                     continue;
                 }
 
+                // Detect BETWEEN keyword at depth 0
+                if ($depth === 0
+                    && ($ch === 'B' || $ch === 'b')
+                    && strncasecmp(substr($where, $i, 7), 'BETWEEN', 7) === 0
+                    && ($i === 0 || ctype_space($where[$i - 1]))
+                    && ($i + 7 >= $len || ctype_space($where[$i + 7]))
+                ) {
+                    $inBetween = true;
+                    $curr .= substr($where, $i, 7);
+                    $i += 7;
+                    continue;
+                }
+
                 // At depth 0, check for \bAND\b keyword
                 if ($depth === 0
                     && ($ch === 'A' || $ch === 'a')
@@ -2625,6 +2790,13 @@ namespace HtmlDatabase\Parser {
                     && ($i === 0 || ctype_space($where[$i - 1]))
                     && ($i + 3 >= $len || ctype_space($where[$i + 3]))
                 ) {
+                    if ($inBetween) {
+                        // Part of BETWEEN … AND …: keep in current part.
+                        $inBetween = false;
+                        $curr .= ' AND ';
+                        $i += 3;
+                        continue;
+                    }
                     $trimmed = trim($curr);
                     if ($trimmed !== '') {
                         $parts[] = $trimmed;
@@ -2824,6 +2996,25 @@ namespace HtmlDatabase\Parser {
                     }
                 }
 
+                // BETWEEN / NOT BETWEEN conditions
+                if ($match) {
+                    foreach ($parsed['betweenConditions'] ?? [] as $bt) {
+                        $val = $data[$bt['col']] ?? '';
+                        if (is_numeric($val) && is_numeric($bt['low']) && is_numeric($bt['high'])) {
+                            $v = (float) $val;
+                            $ok = $v >= (float) $bt['low'] && $v <= (float) $bt['high'];
+                        } else {
+                            $v = (string) $val;
+                            $ok = $v >= (string) $bt['low'] && $v <= (string) $bt['high'];
+                        }
+                        if ($bt['not']) $ok = !$ok;
+                        if (!$ok) {
+                            $match = false;
+                            break;
+                        }
+                    }
+                }
+
                 // LIKE conditions (SQL % → regex .*, _ → regex ., \ escapes honored)
                 if ($match) {
                     foreach ($parsed['likeConditions'] as $col => $pattern) {
@@ -3002,7 +3193,19 @@ namespace HtmlDatabase\Parser {
 
             // Project columns. Requested-but-absent columns are filled with ''
             // so callers never hit "Undefined property" on partial rows.
+            // For SELECT * the persisted schema is authoritative: MySQL
+            // always returns every column (defaults for rows predating an
+            // ALTER TABLE ADD COLUMN), so fill schema gaps the same way.
             $star = in_array('*', $parsed['columns'], true);
+            $schemaCols = [];
+            $schemaDefaults = [];
+            if ($star && $this->storage !== null) {
+                $schema = $this->storage->readSchema($parsed['table']);
+                if ($schema !== null && !empty($schema['columns'])) {
+                    $schemaCols     = array_keys($schema['columns']);
+                    $schemaDefaults = $schema['defaults'] ?? [];
+                }
+            }
             $results = [];
             foreach ($filtered as $data) {
                 $projected = [];
@@ -3011,7 +3214,13 @@ namespace HtmlDatabase\Parser {
                         $projected[$col] = $val;
                     }
                 }
-                if (!$star) {
+                if ($star) {
+                    foreach ($schemaCols as $col) {
+                        if (!array_key_exists($col, $projected)) {
+                            $projected[$col] = (string) ($schemaDefaults[$col] ?? '');
+                        }
+                    }
+                } else {
                     foreach ($parsed['columns'] as $col) {
                         if (!array_key_exists($col, $projected) && $col !== '') {
                             $projected[$col] = '';
@@ -3255,6 +3464,73 @@ namespace HtmlDatabase\Parser {
             $pairs[$col] = stripslashes($rhs);
         }
 
+        /**
+         * Split a WHERE clause on top-level AND, keeping "BETWEEN x AND y"
+         * intact (its AND belongs to the operator, not the splitter).
+         *
+         * @return string[]
+         */
+        private function splitAndRespectingBetween(string $clause): array
+        {
+            $parts = [];
+            $curr  = '';
+            $len   = strlen($clause);
+            $i     = 0;
+            $inBetween = false;
+
+            while ($i < $len) {
+                $ch = $clause[$i];
+
+                if ($ch === "'" || $ch === '"') {
+                    $quote = $ch;
+                    $curr .= $ch;
+                    $i++;
+                    while ($i < $len) {
+                        $c = $clause[$i];
+                        $curr .= $c;
+                        $i++;
+                        if ($c === $quote) break;
+                        if ($c === '\\' && $i < $len) { $curr .= $clause[$i]; $i++; }
+                    }
+                    continue;
+                }
+
+                if (($ch === 'B' || $ch === 'b')
+                    && strncasecmp(substr($clause, $i, 7), 'BETWEEN', 7) === 0
+                    && ($i === 0 || ctype_space($clause[$i - 1]))
+                    && ($i + 7 >= $len || ctype_space($clause[$i + 7]))
+                ) {
+                    $inBetween = true;
+                    $curr .= substr($clause, $i, 7);
+                    $i += 7;
+                    continue;
+                }
+
+                if (($ch === 'A' || $ch === 'a')
+                    && strncasecmp(substr($clause, $i, 3), 'AND', 3) === 0
+                    && ($i === 0 || ctype_space($clause[$i - 1]))
+                    && ($i + 3 >= $len || ctype_space($clause[$i + 3]))
+                ) {
+                    if ($inBetween) {
+                        $inBetween = false;
+                        $curr .= ' AND ';
+                        $i += 3;
+                        continue;
+                    }
+                    if (trim($curr) !== '') $parts[] = trim($curr);
+                    $curr = '';
+                    $i += 3;
+                    continue;
+                }
+
+                $curr .= $ch;
+                $i++;
+            }
+
+            if (trim($curr) !== '') $parts[] = trim($curr);
+            return $parts ?: [$clause];
+        }
+
         private function parseWhereEquality(string $clause): array
         {
             $conditions = [];
@@ -3262,7 +3538,7 @@ namespace HtmlDatabase\Parser {
 
             $clause = preg_replace('/\b[a-zA-Z0-9_]+\.([a-zA-Z0-9_]+)/', '$1', $clause);
 
-            $parts = preg_split('/\s+AND\s+/i', $clause);
+            $parts = $this->splitAndRespectingBetween($clause);
             foreach ($parts as $part) {
                 $part = trim($part);
                 if (preg_match('/^\d+\s*=\s*\d+$/', $part)) continue;
@@ -3273,6 +3549,16 @@ namespace HtmlDatabase\Parser {
                     if (!empty($vals)) {
                         $conditions[$m[1]] = ['__in__' => $vals];
                     }
+                    continue;
+                }
+
+                // col [NOT] BETWEEN a AND b
+                if (preg_match('/^([a-zA-Z0-9_]+)\s+(NOT\s+)?BETWEEN\s+(\'[^\']*\'|"[^"]*"|-?\d+(?:\.\d+)?)\s+AND\s+(\'[^\']*\'|"[^"]*"|-?\d+(?:\.\d+)?)$/is', $part, $m)) {
+                    $conditions[$m[1]] = ['__between__' => [
+                        'not'  => !empty($m[2]),
+                        'low'  => trim($m[3], "'\""),
+                        'high' => trim($m[4], "'\""),
+                    ]];
                     continue;
                 }
 
@@ -3733,14 +4019,28 @@ namespace {
 
         private function resolveColumnDefaults(string $table): array
         {
-            foreach (self::COLUMN_DEFAULTS as $suffix => $defaults) {
-                if ($table === $suffix || str_ends_with($table, '_' . $suffix)) return $defaults;
+            $defaults = [];
+            $schema = $this->storage->readSchema($table);
+            if ($schema !== null && !empty($schema['defaults'])) {
+                $defaults = $schema['defaults'];
             }
-            return [];
+            foreach (self::COLUMN_DEFAULTS as $suffix => $tableDefaults) {
+                if ($table === $suffix || str_ends_with($table, '_' . $suffix)) {
+                    $defaults = array_merge($tableDefaults, $defaults);
+                    break;
+                }
+            }
+            return $defaults;
         }
 
         private function resolveAutoPkColumn(string $table): ?string
         {
+            $schema = $this->storage->readSchema($table);
+            if ($schema !== null) {
+                return isset($schema['auto']) && $schema['auto'] !== null
+                    ? (string) $schema['auto']
+                    : (isset($schema['pk']) && $schema['pk'] !== null ? (string) $schema['pk'] : null);
+            }
             foreach (self::AUTO_PK_MAP as $suffix => $pkCol) {
                 if ($table === $suffix || str_ends_with($table, '_' . $suffix)) return $pkCol;
             }
@@ -3915,7 +4215,233 @@ namespace {
 
         // -- DDL --------------------------------------------------------------
 
-        private function handleDdl(string $sql): bool { return true; }
+        /**
+         * CREATE TABLE / ALTER TABLE are persisted as a per-table
+         * _schema.json (columns, PK, auto-increment column, defaults).
+         * Without this, plugin tables (WooCommerce, ACF custom tables, …)
+         * silently lose their PK and AUTO_INCREMENT: inserts get md5 row
+         * keys and UPDATE/DELETE by id match nothing.
+         */
+        private function handleDdl(string $sql): bool
+        {
+            $sql = trim($sql);
+
+            if (preg_match('/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)\s*\(/is', $sql, $m)) {
+                $table = $m[1];
+                // Locate the matching close paren for the column list
+                $open = strpos($sql, '(', strlen($m[0]) - 1);
+                if ($open === false) return true;
+                $depth = 0;
+                $close = -1;
+                $inStr = false; $strCh = '';
+                $len = strlen($sql);
+                for ($i = $open; $i < $len; $i++) {
+                    $ch = $sql[$i];
+                    if ($inStr) {
+                        if ($ch === '\\') { $i++; continue; }
+                        if ($ch === $strCh) $inStr = false;
+                        continue;
+                    }
+                    if ($ch === "'" || $ch === '"') { $inStr = true; $strCh = $ch; continue; }
+                    if ($ch === '(') $depth++;
+                    elseif ($ch === ')') {
+                        $depth--;
+                        if ($depth === 0) { $close = $i; break; }
+                    }
+                }
+                if ($close === -1) return true;
+                $body = substr($sql, $open + 1, $close - $open - 1);
+                $schema = $this->parseCreateTableBody($body);
+                // Re-creating an existing table (dbDelta re-runs, plugin
+                // reactivation): keep schema authoritative but data was
+                // already dropped/recreated per plugin expectations only
+                // when the plugin issued DROP first. MySQL CREATE TABLE
+                // without IF NOT EXISTS on an existing table errors; the
+                // plugin then runs dbDelta ALTERs. Safer: if the table
+                // already has stored rows, merge new columns into schema
+                // instead of clobbering PK/rows.
+                $existing = $this->storage->readSchema($table);
+                if ($existing !== null) {
+                    $schema['columns']  = $existing['columns'] + $schema['columns'];
+                    $schema['defaults'] = $schema['defaults'] + $existing['defaults'];
+                    if (($existing['pk'] ?? null) !== null && $schema['pk'] === null) {
+                        $schema['pk'] = $existing['pk'];
+                    }
+                    if (($existing['auto'] ?? null) !== null && $schema['auto'] === null) {
+                        $schema['auto'] = $existing['auto'];
+                    }
+                }
+                $this->storage->writeSchema($table, $schema);
+                return true;
+            }
+
+            if (preg_match('/^ALTER\s+TABLE\s+([a-zA-Z0-9_]+)\s+(.+)$/is', $sql, $m)) {
+                $this->applyAlterTable($m[1], $m[2]);
+                return true;
+            }
+
+            // CREATE INDEX / DATABASE / USER etc: accepted, no-op.
+            return true;
+        }
+
+        /**
+         * Split a CREATE TABLE body into top-level definitions (commas at
+         * paren depth 0, quotes respected).
+         *
+         * @return string[]
+         */
+        private function splitTopLevel(string $body): array
+        {
+            $parts = [];
+            $cur = '';
+            $depth = 0;
+            $inStr = false; $strCh = '';
+            $len = strlen($body);
+            for ($i = 0; $i < $len; $i++) {
+                $ch = $body[$i];
+                if ($inStr) {
+                    $cur .= $ch;
+                    if ($ch === '\\') { if ($i + 1 < $len) { $cur .= $body[++$i]; } continue; }
+                    if ($ch === $strCh) $inStr = false;
+                    continue;
+                }
+                if ($ch === "'" || $ch === '"') { $inStr = true; $strCh = $ch; $cur .= $ch; continue; }
+                if ($ch === '(') { $depth++; $cur .= $ch; continue; }
+                if ($ch === ')') { $depth--; $cur .= $ch; continue; }
+                if ($ch === ',' && $depth === 0) { $parts[] = $cur; $cur = ''; continue; }
+                $cur .= $ch;
+            }
+            if (trim($cur) !== '') $parts[] = $cur;
+            return $parts;
+        }
+
+        /**
+         * Parse the column/constraint list of a CREATE TABLE statement.
+         *
+         * @return array{pk:?string,auto:?string,columns:array<string,array>,defaults:array<string,string>}
+         */
+        private function parseCreateTableBody(string $body): array
+        {
+            $schema = ['pk' => null, 'auto' => null, 'columns' => [], 'defaults' => []];
+
+            foreach ($this->splitTopLevel($body) as $def) {
+                $def = trim($def);
+                if ($def === '') continue;
+                $def = preg_replace('/^\`|\`$/', '', trim($def));
+
+                if (preg_match('/^PRIMARY\s+KEY\s*\(([^)]*)\)/i', $def, $pm)) {
+                    $cols = array_map(fn($c) => trim($c, " \t`"), explode(',', $pm[1]));
+                    $schema['pk'] = $cols[0] ?? null; // composite: first column drives rowKey
+                    continue;
+                }
+                if (preg_match('/^(UNIQUE\s+)?(KEY|INDEX|FULLTEXT|SPATIAL|CONSTRAINT|FOREIGN\s+KEY|CHECK)\b/i', $def)) {
+                    continue;
+                }
+
+                // Column definition: name type [modifiers]
+                if (!preg_match('/^`?([a-zA-Z0-9_]+)`?\s+([a-zA-Z]+(?:\s*\([^)]*\))?(?:\s+unsigned)?(?:\s+zerofill)?)/i', $def, $cm)) {
+                    continue;
+                }
+                $col  = $cm[1];
+                $type = strtolower($cm[2]);
+                $rest = substr($def, strlen($cm[0]));
+
+                $schema['columns'][$col] = ['type' => $type];
+
+                if (preg_match('/\bAUTO_INCREMENT\b/i', $rest)) {
+                    $schema['auto'] = $col;
+                    if ($schema['pk'] === null) $schema['pk'] = $col;
+                }
+                if (preg_match("/DEFAULT\\s+('(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|[a-zA-Z0-9_.+-]+)/i", $rest, $dm)) {
+                    $val = $dm[1];
+                    if (preg_match('/^CURRENT_TIMESTAMP|NOW\(|^NULL$/i', $val)) {
+                        // function defaults resolved at insert time; NULL default = no default
+                    } elseif (preg_match("/^'((?:[^']|'')*)'$/s", $val, $qm)) {
+                        $schema['defaults'][$col] = str_replace("''", "'", $qm[1]);
+                    } elseif (preg_match('/^"((?:[^"]|"")*)"$/s', $val, $qm)) {
+                        $schema['defaults'][$col] = str_replace('""', '"', $qm[1]);
+                    } else {
+                        $schema['defaults'][$col] = $val;
+                    }
+                }
+            }
+
+            return $schema;
+        }
+
+        /**
+         * Apply ALTER TABLE actions (ADD/MODIFY/CHANGE/DROP COLUMN, ADD
+         * PRIMARY KEY) to the persisted schema.
+         */
+        private function applyAlterTable(string $table, string $actions): void
+        {
+            $schema = $this->storage->readSchema($table);
+            if ($schema === null) {
+                // Core or implicit table: seed schema from stored columns so
+                // the ALTER has something to modify. PK stays from the map.
+                $cols = [];
+                foreach ($this->storage->listColumns($table) as $c) {
+                    $cols[$c] = ['type' => 'longtext'];
+                }
+                $pk = $this->storage->resolvePkColumn($table);
+                $schema = ['pk' => $pk, 'auto' => $pk, 'columns' => $cols, 'defaults' => []];
+            }
+
+            foreach ($this->splitTopLevel($actions) as $action) {
+                $action = trim($action);
+                if ($action === '') continue;
+
+                if (preg_match('/^ADD\s+(?:COLUMN\s+)?\(?`?([a-zA-Z0-9_]+)`?\s+([a-zA-Z]+(?:\s*\([^)]*\))?)/i', $action, $am)) {
+                    $col = $am[1];
+                    $schema['columns'][$col] = ['type' => strtolower($am[2])];
+                    $rest = substr($action, strlen($am[0]));
+                    if (preg_match('/\bAUTO_INCREMENT\b/i', $rest)) {
+                        $schema['auto'] = $col;
+                        if ($schema['pk'] === null) $schema['pk'] = $col;
+                    }
+                    if (preg_match("/DEFAULT\\s+('(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|[a-zA-Z0-9_.+-]+)/i", $rest, $dm)
+                        && !preg_match('/^CURRENT_TIMESTAMP|NOW\(|^NULL$/i', $dm[1])) {
+                        $v = $dm[1];
+                        if (preg_match("/^'((?:[^']|'')*)'$/s", $v, $qm)) {
+                            $schema['defaults'][$col] = str_replace("''", "'", $qm[1]);
+                        } elseif (preg_match('/^"((?:[^"]|"")*)"$/s', $v, $qm)) {
+                            $schema['defaults'][$col] = str_replace('""', '"', $qm[1]);
+                        } else {
+                            $schema['defaults'][$col] = $v;
+                        }
+                    }
+                    continue;
+                }
+                if (preg_match('/^DROP\s+(?:COLUMN\s+)?`?([a-zA-Z0-9_]+)`?/i', $action, $dm)) {
+                    unset($schema['columns'][$dm[1]], $schema['defaults'][$dm[1]]);
+                    if (($schema['pk'] ?? null) === $dm[1]) $schema['pk'] = null;
+                    if (($schema['auto'] ?? null) === $dm[1]) $schema['auto'] = null;
+                    continue;
+                }
+                if (preg_match('/^CHANGE\s+(?:COLUMN\s+)?`?([a-zA-Z0-9_]+)`?\s+`?([a-zA-Z0-9_]+)`?/i', $action, $cm)) {
+                    [$old, $new] = [$cm[1], $cm[2]];
+                    if (isset($schema['columns'][$old])) {
+                        $schema['columns'][$new] = $schema['columns'][$old];
+                        unset($schema['columns'][$old]);
+                    }
+                    if (array_key_exists($old, $schema['defaults'])) {
+                        $schema['defaults'][$new] = $schema['defaults'][$old];
+                        unset($schema['defaults'][$old]);
+                    }
+                    if (($schema['pk'] ?? null) === $old) $schema['pk'] = $new;
+                    if (($schema['auto'] ?? null) === $old) $schema['auto'] = $new;
+                    continue;
+                }
+                if (preg_match('/^ADD\s+PRIMARY\s+KEY\s*\(([^)]*)\)/i', $action, $pm)) {
+                    $cols = array_map(fn($c) => trim($c, " \t`"), explode(',', $pm[1]));
+                    $schema['pk'] = $cols[0] ?? $schema['pk'];
+                    continue;
+                }
+                // MODIFY/other ALTER actions: accepted, no schema change needed.
+            }
+
+            $this->storage->writeSchema($table, $schema);
+        }
 
         /**
          * DROP TABLE / TRUNCATE TABLE must actually remove data, otherwise
@@ -3948,9 +4474,17 @@ namespace {
             $this->num_rows    = 0;
 
             if (preg_match('/SHOW\s+COLUMNS\s+FROM\s+([a-zA-Z0-9_]+)/i', $sql, $cm)) {
+                $schema = $this->storage->readSchema($cm[1]);
                 $cols = $this->storage->listColumns($cm[1]);
                 foreach ($cols as $col) {
-                    $this->last_result[] = (object) ['Field' => $col, 'Type' => 'longtext', 'Null' => 'YES', 'Key' => '', 'Default' => null, 'Extra' => ''];
+                    $type  = $schema['columns'][$col]['type'] ?? 'longtext';
+                    $extra = (($schema['auto'] ?? null) === $col) ? 'auto_increment' : '';
+                    $key   = (($schema['pk'] ?? null) === $col) ? 'PRI' : '';
+                    $def   = $schema['defaults'][$col] ?? null;
+                    $this->last_result[] = (object) [
+                        'Field' => $col, 'Type' => $type, 'Null' => 'YES',
+                        'Key' => $key, 'Default' => $def, 'Extra' => $extra,
+                    ];
                 }
                 $this->num_rows = count($this->last_result);
             }
@@ -3976,7 +4510,23 @@ namespace {
         {
             $this->last_result = [];
             $this->num_rows    = 0;
-            return 0;
+
+            if (preg_match('/^(?:DESCRIBE|DESC)\s+([a-zA-Z0-9_]+)/i', trim($sql), $m)) {
+                $schema = $this->storage->readSchema($m[1]);
+                foreach ($this->storage->listColumns($m[1]) as $col) {
+                    $type  = $schema['columns'][$col]['type'] ?? 'longtext';
+                    $extra = (($schema['auto'] ?? null) === $col) ? 'auto_increment' : '';
+                    $key   = (($schema['pk'] ?? null) === $col) ? 'PRI' : '';
+                    $def   = $schema['defaults'][$col] ?? null;
+                    $this->last_result[] = (object) [
+                        'Field' => $col, 'Type' => $type, 'Null' => 'YES',
+                        'Key' => $key, 'Default' => $def, 'Extra' => $extra,
+                    ];
+                }
+                $this->num_rows = count($this->last_result);
+            }
+
+            return $this->num_rows;
         }
 
         // -- WordPress compatibility hacks ------------------------------------
