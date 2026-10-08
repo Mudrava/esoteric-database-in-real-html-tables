@@ -110,11 +110,15 @@ namespace HtmlDatabase\Core {
         /**
          * Compute which chunk file a given PK value belongs to.
          *
+         * $chunkSize overrides the global default when the table's
+         * _meta.json was created with a different size.
+         *
          * @return string Chunk filename, e.g. "chunk_0003.html"
          */
-        public function chunkForPk(int $pkValue): string
+        public function chunkForPk(int $pkValue, ?int $chunkSize = null): string
         {
-            $num = (int) ceil($pkValue / $this->config->chunkSize);
+            $size = $chunkSize ?? $this->config->chunkSize;
+            $num = (int) ceil($pkValue / $size);
             if ($num < 1) $num = 1;
             return sprintf('chunk_%04d.html', $num);
         }
@@ -124,15 +128,16 @@ namespace HtmlDatabase\Core {
          *
          * @return array{from: int, to: int}
          */
-        public function chunkRange(string $chunkFile): array
+        public function chunkRange(string $chunkFile, ?int $chunkSize = null): array
         {
+            $size = $chunkSize ?? $this->config->chunkSize;
             if (preg_match('/chunk_(\d+)\.html$/', $chunkFile, $m)) {
                 $num = (int) $m[1];
-                $from = ($num - 1) * $this->config->chunkSize + 1;
-                $to   = $num * $this->config->chunkSize;
+                $from = ($num - 1) * $size + 1;
+                $to   = $num * $size;
                 return ['from' => $from, 'to' => $to];
             }
-            return ['from' => 1, 'to' => $this->config->chunkSize];
+            return ['from' => 1, 'to' => $size];
         }
 
         /**
@@ -143,13 +148,13 @@ namespace HtmlDatabase\Core {
          *
          * @return string[] List of chunk filenames to scan.
          */
-        public function resolveChunks(string $tableDir, ?string $pkCol, array $conditions): array
+        public function resolveChunks(string $tableDir, ?string $pkCol, array $conditions, ?int $chunkSize = null): array
         {
             // If we have a scalar PK equality condition, narrow to one chunk
             if ($pkCol !== null && isset($conditions[$pkCol]) && !is_array($conditions[$pkCol])) {
                 $pkVal = (int) $conditions[$pkCol];
                 if ($pkVal > 0) {
-                    $chunk = $this->chunkForPk($pkVal);
+                    $chunk = $this->chunkForPk($pkVal, $chunkSize);
                     $path  = $tableDir . '/' . $chunk;
                     // If the specific chunk doesn't exist yet (data only in WAL), return empty
                     return file_exists($path) ? [$chunk] : [];
@@ -670,7 +675,7 @@ HTML;
             }
 
             // 1. Determine which chunks to read
-            $chunkFiles = $this->router->resolveChunks($tableDir, $pkCol, $conditions);
+            $chunkFiles = $this->router->resolveChunks($tableDir, $pkCol, $conditions, $this->tableChunkSize($table));
 
             // 2. Read rows from chunks
             $rows = []; // keyed by PK if available, else sequential
@@ -1171,12 +1176,13 @@ HTML;
                 // Step 4: Re-bucket rows into chunks
                 $buckets = []; // chunkNum => rows[]
                 $seq = 0;
+                $tableChunk = $this->tableChunkSize($table);
                 foreach ($rowsByKey as $row) {
                     if ($pkCol !== null && isset($row['data'][$pkCol]) && (int) $row['data'][$pkCol] > 0) {
-                        $num = (int) ceil(((int) $row['data'][$pkCol]) / $this->config->chunkSize);
+                        $num = (int) ceil(((int) $row['data'][$pkCol]) / $tableChunk);
                         if ($num < 1) $num = 1;
                     } else {
-                        $num = (int) floor($seq / $this->config->chunkSize) + 1;
+                        $num = (int) floor($seq / $tableChunk) + 1;
                     }
                     $buckets[$num][] = $row;
                     $seq++;
@@ -1636,11 +1642,13 @@ HTML;
                 $walEntries = count($entries);
             }
 
-            // Write _meta.json
+            // Write _meta.json. Preserve the table's original chunk_size so
+            // changing HTMLDB_CHUNK_SIZE later cannot misroute reads against
+            // chunks already bucketed with the old size.
             $meta = [
                 'table'       => $table,
                 'pk'          => $this->resolvePkColumn($table),
-                'chunk_size'  => $this->config->chunkSize,
+                'chunk_size'  => $this->tableChunkSize($table),
                 'chunks'      => count($chunks),
                 'total_rows'  => $totalRows,
                 'wal_entries' => $walEntries,
@@ -1703,6 +1711,18 @@ HTML;
                 }
             }
             return [];
+        }
+
+        /**
+         * The chunk size a table was created with. Persisted in _meta.json
+         * so changing HTMLDB_CHUNK_SIZE later cannot misroute reads against
+         * chunks written with the old size. Falls back to the global default
+         * for tables created before the field existed.
+         */
+        private function tableChunkSize(string $table): int
+        {
+            $size = (int) ($this->readMeta($table)['chunk_size'] ?? 0);
+            return $size > 0 ? $size : $this->config->chunkSize;
         }
 
         /**
@@ -3959,7 +3979,13 @@ namespace {
             $storagePath = defined('HTMLDB_BASE_PATH')
                 ? HTMLDB_BASE_PATH
                 : WP_CONTENT_DIR . '/html_db';
-            $config      = new Configuration($storagePath);
+            $chunkSize = defined('HTMLDB_CHUNK_SIZE')
+                ? max(10, (int) HTMLDB_CHUNK_SIZE)
+                : 500;
+            $compactThreshold = defined('HTMLDB_COMPACT_THRESHOLD')
+                ? max(10, (int) HTMLDB_COMPACT_THRESHOLD)
+                : 200;
+            $config      = new Configuration($storagePath, $chunkSize, $compactThreshold);
 
             $this->storage         = new ShardedStorageManager($config);
             $this->translator      = new SqlToXpathTranslator($storagePath, $this->storage);
