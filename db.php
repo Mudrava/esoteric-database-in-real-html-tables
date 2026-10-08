@@ -1313,6 +1313,21 @@ HTML;
         }
 
         /**
+         * Render one payload column as an escaped <td>, encrypting secret
+         * columns first. Shared by the WAL and chunk row builders.
+         */
+        private function renderCell(string $column, mixed $value): string
+        {
+            $safeCol = htmlspecialchars($column, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            $rawVal  = (string) $value;
+            if ($this->isSecretColumn($column)) {
+                $rawVal = $this->encryptSecret($rawVal);
+            }
+            $safeVal = htmlspecialchars($rawVal, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            return sprintf('<td data-column="%s">%s</td>', $safeCol, $safeVal);
+        }
+
+        /**
          * Build an MVCC WAL entry with operation type and PK.
          */
         private function buildWalEntry(array $payload, string $op, int $txId, string $pk): string
@@ -1324,13 +1339,7 @@ HTML;
                 htmlspecialchars($pk)
             );
             foreach ($payload as $column => $value) {
-                $safeCol = htmlspecialchars((string) $column, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                $rawVal  = (string) $value;
-                if ($this->isSecretColumn((string) $column)) {
-                    $rawVal = $this->encryptSecret($rawVal);
-                }
-                $safeVal = htmlspecialchars($rawVal, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                $html .= sprintf('<td data-column="%s">%s</td>', $safeCol, $safeVal);
+                $html .= $this->renderCell((string) $column, $value);
             }
             $html .= "</tr>\n";
             return $html;
@@ -1343,13 +1352,7 @@ HTML;
         {
             $html = sprintf('<tr data-tx="%d">', $tx);
             foreach ($payload as $column => $value) {
-                $safeCol = htmlspecialchars((string) $column, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                $rawVal  = (string) $value;
-                if ($this->isSecretColumn((string) $column)) {
-                    $rawVal = $this->encryptSecret($rawVal);
-                }
-                $safeVal = htmlspecialchars($rawVal, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                $html .= sprintf('<td data-column="%s">%s</td>', $safeCol, $safeVal);
+                $html .= $this->renderCell((string) $column, $value);
             }
             $html .= "</tr>\n";
             return $html;
@@ -4073,7 +4076,13 @@ namespace {
                     'SET', 'START', 'COMMIT', 'ROLLBACK', 'SAVEPOINT', 'RELEASE' => true,
                     'SHOW'   => $this->handleShow($clean),
                     'DESCRIBE', 'DESC' => $this->handleDescribe($clean),
-                    default  => true,
+                    default => (function () use ($clean, $verb) {
+                        // Unknown verb: keep returning true for core
+                        // compatibility (WP sends exotic SET/SHOW variants),
+                        // but leave a breadcrumb for debugging plugin SQL.
+                        error_log('[HtmlDB] UNHANDLED VERB: ' . $verb . ' | SQL: ' . substr($clean, 0, 300));
+                        return true;
+                    })(),
                 };
             } catch (\Throwable $e) {
                 $this->last_error = $e->getMessage();
