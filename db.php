@@ -1,13 +1,13 @@
 <?php
 /**
  * Plugin Name: HTML Database Drop-in
- * Description: Esoteric HTML-based database engine for WordPress — replaces MySQL with flat HTML files.
+ * Description: Esoteric HTML-based database engine for WordPress - replaces MySQL with flat HTML files.
  * Version: 3.0.0
  *
- * Architecture (v3 — Sharded Storage):
+ * Architecture (v3 - Sharded Storage):
  *   - Each table is a folder: html_db/{table}/ with chunk files and an append-only WAL.
  *   - Chunks hold ≤ CHUNK_SIZE rows (default 500) as full HTML pages with retro-terminal CSS.
- *   - All mutations (INSERT, UPDATE, DELETE) append to wal.html — O(1), crash-safe.
+ *   - All mutations (INSERT, UPDATE, DELETE) append to wal.html - O(1), crash-safe.
  *   - SELECTs route via ShardRouter: PK-based queries touch one chunk + WAL.
  *   - Background compaction merges WAL entries into chunks (triggered by threshold).
  *   - Global monotonic TX counter for MVCC ordering across requests.
@@ -29,7 +29,7 @@ namespace {
 }
 
 // ---------------------------------------------------------------------------
-// Namespace: HtmlDatabase\Core — Configuration, Shard Router, Storage Manager
+// Namespace: HtmlDatabase\Core - Configuration, Shard Router, Storage Manager
 // ---------------------------------------------------------------------------
 namespace HtmlDatabase\Core {
 
@@ -96,12 +96,12 @@ namespace HtmlDatabase\Core {
      *
      * Each table is stored as:
      *   html_db/{table}/
-     *     _meta.json        — metadata (pk column, chunk_size, row count, etc.)
-     *     _index.html       — human-browsable table-of-contents
-     *     chunk_0001.html   — rows with PK 1..chunk_size
-     *     chunk_0002.html   — rows with PK chunk_size+1..2*chunk_size
-     *     wal.html          — append-only mutation journal
-     *     .seq              — auto-increment counter
+     *     _meta.json        - metadata (pk column, chunk_size, row count, etc.)
+     *     _index.html       - human-browsable table-of-contents
+     *     chunk_0001.html   - rows with PK 1..chunk_size
+     *     chunk_0002.html   - rows with PK chunk_size+1..2*chunk_size
+     *     wal.html          - append-only mutation journal
+     *     .seq              - auto-increment counter
      */
     final class ShardRouter
     {
@@ -349,7 +349,7 @@ HTML;
             foreach ($chunks as $i => $chunkFile) {
                 $num   = $i + 1;
                 $range = (($num - 1) * $this->config->chunkSize + 1) . '–' . ($num * $this->config->chunkSize);
-                $chunkLinks .= "      <li><a href=\"{$chunkFile}\">Chunk {$num}</a> — rows {$range}</li>\n";
+                $chunkLinks .= "      <li><a href=\"{$chunkFile}\">Chunk {$num}</a> - rows {$range}</li>\n";
             }
 
             return <<<HTML
@@ -388,7 +388,7 @@ HTML;
             $tableLinks = '';
             foreach ($tables as $info) {
                 $tableLinks .= sprintf(
-                    "      <li><a href=\"%s/_index.html\">%s</a> — %d rows, %d chunks</li>\n",
+                    "      <li><a href=\"%s/_index.html\">%s</a> - %d rows, %d chunks</li>\n",
                     htmlspecialchars($info['name']),
                     htmlspecialchars($info['name']),
                     $info['rows'],
@@ -401,12 +401,12 @@ HTML;
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>HtmlDB — Database Index</title>
+  <title>HtmlDB - Database Index</title>
   <link rel="stylesheet" href="_style.css">
 </head>
 <body>
   <header>
-    <h1>🗄️ HtmlDB — Database Browser</h1>
+    <h1>🗄️ HtmlDB - Database Browser</h1>
   </header>
   <h2>Tables</h2>
   <ul class="chunk-list">
@@ -435,7 +435,7 @@ HTML;
 </head>
 <body>
   <header>
-    <h1>📝 {$table} — WAL</h1>
+    <h1>📝 {$table} - WAL</h1>
     <nav>
       <a href="_index.html">⌂ Index</a>
     </nav>
@@ -716,7 +716,7 @@ HTML;
                                 }
                             }
                         } else {
-                            // Update for a row not in chunks — treat as full row
+                            // Update for a row not in chunks - treat as full row
                             $rows[$pkCol === null ? $this->rowKey($table, $entry['data']) : $key]
                                 = ['data' => $entry['data'], 'tx' => $entry['tx']];
                         }
@@ -1084,7 +1084,7 @@ HTML;
         /**
          * Fold WAL entries into chunk files.
          *
-         * Strategy (full rebuild — simple and correct):
+         * Strategy (full rebuild - simple and correct):
          * 1. Acquire exclusive compact lock
          * 2. Rename wal.html → wal.processing.html (new writes go to fresh wal.html)
          * 3. Read ALL chunks, apply every WAL entry in TX order
@@ -1100,7 +1100,7 @@ HTML;
 
             $lockFile = new SplFileObject($lockPath, 'c+');
             if (!$lockFile->flock(LOCK_EX | LOCK_NB)) {
-                // Another process is compacting — skip
+                // Another process is compacting - skip
                 return;
             }
 
@@ -1203,7 +1203,7 @@ HTML;
                     }
                 }
                 if (empty($buckets)) {
-                    // Table emptied — write a single empty chunk so pages exist
+                    // Table emptied - write a single empty chunk so pages exist
                     $this->writeChunkFile($table, 'chunk_0001.html', [], 1);
                 }
 
@@ -1337,7 +1337,7 @@ HTML;
         }
 
         /**
-         * Build a chunk <tr> row (no MVCC attributes — compacted data).
+         * Build a chunk <tr> row (no MVCC attributes - compacted data).
          */
         private function buildChunkRow(array $payload, int $tx): string
         {
@@ -1803,14 +1803,14 @@ HTML;
             $size = filesize($filePath);
 
             if ($size === false || $size < 50) {
-                // New WAL — write full HTML page
+                // New WAL - write full HTML page
                 ftruncate($fh, 0);
                 rewind($fh);
                 $header = $this->pageBuilder->buildWalHeader($table);
                 $footer = $this->pageBuilder->buildWalFooter();
                 fwrite($fh, $header . $trContent . $footer);
             } else {
-                // Existing WAL — find </tbody> and insert before it.
+                // Existing WAL - find </tbody> and insert before it.
                 // Window must comfortably exceed the footer size or the marker
                 // gets lost and the file degrades to raw-append mode.
                 $tailLen = min($size, 4096);
@@ -1850,7 +1850,7 @@ HTML;
                 mkdir($dir, 0755, true);
             }
 
-            // Security: .htaccess. Default is deny-all — the storage files
+            // Security: .htaccess. Default is deny-all - the storage files
             // (chunks, WAL) contain raw row data and must not be web-readable.
             // Set HTMLDB_BROWSE=true in wp-config.php to expose the browsable
             // HTML browser (index/chunk/WAL pages) for demos; internals stay
@@ -1859,7 +1859,7 @@ HTML;
             $htaccessPath = $dir . '/.htaccess';
             $htaccess = $this->config->browse
                 ? implode("\n", [
-                    '# HtmlDB — browse mode: pages yes, raw internals no',
+                    '# HtmlDB - browse mode: pages yes, raw internals no',
                     '<IfModule mod_authz_core.c>',
                     '    <FilesMatch "(^\\.|\\.tmp$|\\.lock$|^_meta\\.json$|^_schema\\.json$|^_global\\.seq$)">',
                     '        Require all denied',
@@ -1877,7 +1877,7 @@ HTML;
                     '',
                 ])
                 : implode("\n", [
-                    '# HtmlDB — storage is private by default.',
+                    '# HtmlDB - storage is private by default.',
                     '# Set HTMLDB_BROWSE=true in wp-config.php to enable the',
                     '# browsable HTML database viewer.',
                     '<IfModule mod_authz_core.c>',
@@ -1922,7 +1922,7 @@ HTML;
         private function writeRetroCSS(string $path): void
         {
             $css = <<<'CSS'
-/* HtmlDB v3.0 — Retro Terminal Theme */
+/* HtmlDB v3.0 - Retro Terminal Theme */
 
 :root {
   --bg: #0a0a0a;
@@ -2126,7 +2126,7 @@ CSS;
 }
 
 // ---------------------------------------------------------------------------
-// Namespace: HtmlDatabase\Parser — SQL Tokenizer & XPath Translator
+// Namespace: HtmlDatabase\Parser - SQL Tokenizer & XPath Translator
 // ---------------------------------------------------------------------------
 namespace HtmlDatabase\Parser {
 
@@ -2376,7 +2376,7 @@ namespace HtmlDatabase\Parser {
      * Translates SQL SELECT statements and executes them against the
      * sharded HTML storage using the ShardedStorageManager.
      *
-     * v3: No more DOMDocument — uses string-based parsing from
+     * v3: No more DOMDocument - uses string-based parsing from
      * ShardedStorageManager for chunk + WAL merging.
      */
     final class SqlToXpathTranslator
@@ -2495,7 +2495,7 @@ namespace HtmlDatabase\Parser {
                 }
             }
 
-            // Raw WHERE — extracted BEFORE prefix stripping so that
+            // Raw WHERE - extracted BEFORE prefix stripping so that
             // alias-qualified conditions can be attributed to joined tables.
             $rawWhere = null;
             if (preg_match('/WHERE\s+(.*?)(?:\s+ORDER\s+BY|\s+GROUP\s+BY|\s+LIMIT|\s+HAVING|$)/is', $sql, $wm)) {
@@ -2592,7 +2592,7 @@ namespace HtmlDatabase\Parser {
                 $rawWhere = empty($kept) ? null : implode(' AND ', $kept);
             }
 
-            // Raw SELECT list — captured BEFORE prefix stripping so that
+            // Raw SELECT list - captured BEFORE prefix stripping so that
             // alias-qualified columns (t.*, tt.count) can drive join fan-out.
             preg_match('/SELECT\s+(DISTINCT\s+)?(.*?)\s+FROM/is', $sql, $colMatch);
             $distinct = !empty($colMatch[1]);
@@ -2617,7 +2617,7 @@ namespace HtmlDatabase\Parser {
 
             // Columns: normalize "expr AS alias" to the alias, drop function
             // expressions (aggregates are computed separately). Capture the
-            // select list with a match — a preg_replace here would delete the
+            // select list with a match - a preg_replace here would delete the
             // FROM keyword and glue the rest of the query onto the last column.
             $rawCols = preg_match('/SELECT\s+(?:DISTINCT\s+)?(.*?)\s+FROM/is', $sql, $rcm)
                 ? $rcm[1] : '*';
@@ -3172,7 +3172,7 @@ namespace HtmlDatabase\Parser {
                     }
                     if (empty($matched)) {
                         // A LEFT JOIN keeps the row NULL-extended, but a WHERE
-                        // filter on that alias then rejects NULL — matching MySQL,
+                        // filter on that alias then rejects NULL - matching MySQL,
                         // which effectively turns such a LEFT JOIN into INNER.
                         $filteredAlias = false;
                         foreach ($parsed['joinFilters'] as $jf) {
@@ -3747,7 +3747,7 @@ namespace HtmlDatabase\Parser {
             // NULL literal
             if (strcasecmp($rhs, 'NULL') === 0) { $pairs[$col] = ''; return; }
 
-            // CASE WHEN col='v' THEN r WHEN ... [ELSE e] END — resolved per
+            // CASE WHEN col='v' THEN r WHEN ... [ELSE e] END - resolved per
             // row at write time (wp_update_term_count_now / comment counts).
             if (preg_match('/^CASE\b(.*)\bEND$/is', $rhs, $cm)) {
                 $cases = [];
@@ -3946,7 +3946,7 @@ namespace HtmlDatabase\Parser {
 }
 
 // ---------------------------------------------------------------------------
-// Global namespace — HtmlDatabase_WPDB adapter (extends wpdb)
+// Global namespace - HtmlDatabase_WPDB adapter (extends wpdb)
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -4126,7 +4126,7 @@ namespace {
                 return $this->handleDateFunctions($sql);
             }
 
-            // GROUP BY + COUNT(*) — handled natively by the translator now
+            // GROUP BY + COUNT(*) - handled natively by the translator now
             // (fan-out joins, HAVING, multi-aggregates).
 
             // UNION
@@ -4209,7 +4209,7 @@ namespace {
                 $results[] = (object) $combo;
             }
 
-            // ORDER BY — inherit from parsed SQL (typically ORDER BY post_date DESC)
+            // ORDER BY - inherit from parsed SQL (typically ORDER BY post_date DESC)
             // Results are already grouped, just preserve the order they appeared.
 
             if ($limit !== null || $offset > 0) {
@@ -4303,7 +4303,7 @@ namespace {
                 }
             }
 
-            // Simple UNION — plain UNION deduplicates, UNION ALL does not
+            // Simple UNION - plain UNION deduplicates, UNION ALL does not
             $isAll = (bool) preg_match('/\bUNION\s+ALL\b/i', $sql);
             $parts = preg_split('/\bUNION\s+(ALL\s+)?/i', $sql);
             $allRows = [];
