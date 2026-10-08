@@ -1,0 +1,59 @@
+name: Bug report
+about: Something does not work as documented
+title: "[bug] "
+labels: bug
+body:
+  - type: markdown
+    attributes:
+      value: >
+        This engine is experimental and not for production. Reports about
+        production readiness will be closed as won't-fix.
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: What happened, and what did you expect instead?
+      placeholder: >
+        A SELECT with a LIKE filter on wp_options returns an empty result
+        while the row is visible in the chunk file.
+    validations:
+      required: true
+  - type: textarea
+    id: query
+    attributes:
+      label: Failing query
+      description: >
+        The wpdb call or raw SQL that fails. Enable WP_DEBUG and include any
+        [HtmlDB] log lines from the PHP error log.
+      render: php
+    validations:
+      required: true
+  - type: input
+    id: php-version
+    attributes:
+      label: PHP version
+      placeholder: "8.1"
+    validations:
+      required: true
+  - type: input
+    id: wp-version
+    attributes:
+      label: WordPress version
+      placeholder: "6.8"
+    validations:
+      required: true
+  - type: textarea
+    id: table-state
+    attributes:
+      label: Table state
+      description: >
+        For the affected table directory, paste _meta.json and the WAL size
+        (ls -la wal.html). Redact anything sensitive.
+      render: json
+  - type: checkboxes
+    id: bench
+    attributes:
+      label: Bench check
+      options:
+        - label: I ran ./tests/run.sh and can reproduce this with a failing suite
+        - label: I read the Limitations section of the README first

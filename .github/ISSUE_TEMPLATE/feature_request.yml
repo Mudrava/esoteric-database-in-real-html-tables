@@ -1,0 +1,34 @@
+name: Feature request
+about: An improvement to the engine, bench, or docs
+title: "[feat] "
+labels: enhancement
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Scope check: the engine is a single-file drop-in for an experimental
+        project. Proposals that need a second file, a Composer dependency, or
+        production-grade concurrency are out of scope by design.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is hard or impossible today?
+      description: Concrete queries, plugins, or workflows affected.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed approach
+      description: >
+        How it could work inside the current architecture (chunks, WAL,
+        compaction, flock). Sketches welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: cost
+    attributes:
+      label: Expected cost
+      description: >
+        Read/write amplification, extra file operations, or complexity this
+        would add. Honest estimates beat optimism.
