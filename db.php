@@ -552,7 +552,8 @@ HTML;
 
             $html = '';
             foreach ($matchingRows as $row) {
-                // Resolve arithmetic deltas against the current row value
+                // Resolve arithmetic deltas and CASE expressions against the
+                // current row value
                 $resolved = [];
                 foreach ($setValues as $col => $val) {
                     if (is_array($val) && array_key_exists('__delta__', $val)) {
@@ -560,6 +561,8 @@ HTML;
                         $resolved[$col] = (fmod($sum, 1.0) === 0.0)
                             ? (string) (int) $sum
                             : (string) $sum;
+                    } elseif (is_array($val) && array_key_exists('__case__', $val)) {
+                        $resolved[$col] = $this->resolveCase($val['__case__'], $row);
                     } else {
                         $resolved[$col] = $val;
                     }
@@ -796,6 +799,8 @@ HTML;
                     $resolved[$col] = (fmod($sum, 1.0) === 0.0)
                         ? (string) (int) $sum
                         : (string) $sum;
+                } elseif (is_array($val) && array_key_exists('__case__', $val)) {
+                    $resolved[$col] = $this->resolveCase($val['__case__'], $existing);
                 } else {
                     $resolved[$col] = $val;
                 }
@@ -805,6 +810,21 @@ HTML;
             $this->incrementMeta($table, 'wal_entries', 1);
             $this->maybeCompact($table);
             return 1;
+        }
+
+        /**
+         * Evaluate a parsed CASE WHEN expression against a row.
+         *
+         * @param array{cases:array<int,array{col:string,val:string,then:string}>,else:?string} $case
+         */
+        private function resolveCase(array $case, array $row): string
+        {
+            foreach ($case['cases'] as $c) {
+                if ((string) ($row[$c['col']] ?? '') === (string) $c['val']) {
+                    return (string) $c['then'];
+                }
+            }
+            return $case['else'] ?? '';
         }
 
         /**
@@ -2263,19 +2283,52 @@ namespace HtmlDatabase\Parser {
             $calcFoundRows = (bool) preg_match('/\bSQL_CALC_FOUND_ROWS\b/i', $sql);
             $sql = preg_replace('/\bSQL_CALC_FOUND_ROWS\b/i', '', $sql);
 
-            // FROM table + optional alias
-            if (!preg_match('/FROM\s+([a-zA-Z0-9_]+)(?:\s+(?:AS\s+)?([a-zA-Z0-9_]+))?/i', $sql, $tblMatch)) {
+            // FROM clause: a comma-separated table list up to the first
+            // JOIN/WHERE/GROUP/ORDER/LIMIT/HAVING keyword. Comma tables are
+            // implicit INNER joins whose ON condition lives in WHERE
+            // (wp_update_term_count_now and friends emit this form).
+            if (!preg_match('/\bFROM\b\s+(.*?)(?=\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bHAVING\b|$)/is', $sql, $fromMatch)) {
                 return null;
             }
-            $table     = $tblMatch[1];
-            $mainAlias = $tblMatch[2] ?? '';
+            $fromClause = trim($fromMatch[1]);
+
+            // Split off explicit JOIN clauses; the prefix is the table list.
+            $joinKwOffset = strlen($fromClause);
+            if (preg_match('/\b(?:INNER|LEFT|RIGHT|CROSS|JOIN)\b/i', $fromClause, $jk, PREG_OFFSET_CAPTURE)) {
+                $joinKwOffset = $jk[0][1];
+            }
+            $tableList = trim(substr($fromClause, 0, $joinKwOffset));
+
             $sqlKw = ['WHERE', 'ORDER', 'GROUP', 'LIMIT', 'INNER', 'LEFT', 'RIGHT',
                       'CROSS', 'JOIN', 'ON', 'SET', 'VALUES', 'UNION', 'HAVING', 'FOR'];
-            if ($mainAlias !== '' && in_array(strtoupper($mainAlias), $sqlKw, true)) {
-                $mainAlias = '';
+
+            $tableEntries = array_map('trim', explode(',', $tableList));
+            $mainRaw = $tableEntries[0] ?? '';
+            if ($mainRaw === '') return null;
+            $mainTokens = preg_split('/\s+/', trim($mainRaw));
+            $table     = array_shift($mainTokens);
+            $mainAlias = $table;
+            foreach ($mainTokens as $tk) {
+                if (strcasecmp($tk, 'AS') === 0) continue;
+                if (in_array(strtoupper($tk), $sqlKw, true)) continue;
+                $mainAlias = $tk;
+                break;
             }
-            if ($mainAlias === '') {
-                $mainAlias = $table;
+
+            // Additional comma tables: alias => table (implicit joins).
+            $commaTables = [];
+            for ($ti = 1; $ti < count($tableEntries); $ti++) {
+                $toks = preg_split('/\s+/', trim($tableEntries[$ti]));
+                if (empty($toks) || $toks[0] === '') continue;
+                $cTable = $toks[0];
+                $cAlias = $cTable;
+                foreach ($toks as $tk) {
+                    if (strcasecmp($tk, 'AS') === 0) continue;
+                    if (in_array(strtoupper($tk), $sqlKw, true)) continue;
+                    $cAlias = $tk;
+                    break;
+                }
+                $commaTables[$cAlias] = $cTable;
             }
 
             // JOIN specs: alias => join graph edge toward its parent alias
@@ -2311,11 +2364,65 @@ namespace HtmlDatabase\Parser {
                 $rawWhere = trim($wm[1]);
             }
 
+            // Wire comma tables into the join graph. Their ON condition lives
+            // in WHERE as "alias.col = other.col"; extract it and drop it from
+            // the residual WHERE so it is not double-applied as a filter.
+            if (!empty($commaTables) && $rawWhere !== null) {
+                $known = array_merge([$mainAlias => $table], $joins ? array_map(fn($s) => $s['table'], $joins) : []);
+                foreach ($commaTables as $cAlias => $cTable) {
+                    $known[$cAlias] = $cTable;
+                }
+                $remaining = $rawWhere;
+                foreach ($commaTables as $cAlias => $cTable) {
+                    // Find "cAlias.col = other.col" or "other.col = cAlias.col"
+                    $pattern = '/\b(' . preg_quote($cAlias, '/') . ')\.([a-zA-Z0-9_]+)\s*=\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\b|\b([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*=\s*(' . preg_quote($cAlias, '/') . ')\.([a-zA-Z0-9_]+)\b/i';
+                    if (preg_match($pattern, $remaining, $cj, PREG_OFFSET_CAPTURE)) {
+                        if (isset($cj[1]) && $cj[1][1] !== -1) {
+                            $thisCol   = $cj[2][0];
+                            $pAlias    = $cj[3][0];
+                            $parentCol = $cj[4][0];
+                        } else {
+                            $pAlias    = $cj[5][0];
+                            $parentCol = $cj[6][0];
+                            $thisCol   = $cj[8][0];
+                        }
+                        if (isset($known[$pAlias]) || $pAlias === $mainAlias) {
+                            $joins[$cAlias] = [
+                                'table'     => $cTable,
+                                'parent'    => $pAlias,
+                                'parentCol' => $parentCol,
+                                'thisCol'   => $thisCol,
+                                'left'      => false,
+                            ];
+                            // Remove the matched condition (and a trailing/leading AND)
+                            $full = $cj[0][0];
+                            $off  = $cj[0][1];
+                            $before = substr($remaining, 0, $off);
+                            $after  = substr($remaining, $off + strlen($full));
+                            $before = preg_replace('/\s+AND\s*$/i', '', $before);
+                            $after  = preg_replace('/^\s*AND\s+/i', '', $after);
+                            $remaining = trim($before . ' ' . $after);
+                        }
+                    }
+                }
+                $rawWhere = $remaining !== '' ? $remaining : null;
+            }
+
             // Route alias-qualified conditions on joined tables into joinFilters
             $joinFilters = [];
             if ($rawWhere !== null && !empty($joins)) {
                 $kept = [];
+                // Flatten first: a parenthesized group like
+                // ( pm.meta_key = 'x' AND pm.meta_value = 'y' ) must have its
+                // inner ANDs split before each atomic condition can be routed
+                // to its join. OR groups are preserved intact by the flattener.
+                $flatParts = [];
                 foreach ($this->splitOnTopLevelAnd($rawWhere) as $part) {
+                    foreach ($this->flattenWherePart($part) as $fp) {
+                        $flatParts[] = $fp;
+                    }
+                }
+                foreach ($flatParts as $part) {
                     $p = $this->stripOuterParens(trim($part));
 
                     // OR group over the same joined column → IN filter
@@ -2519,6 +2626,12 @@ namespace HtmlDatabase\Parser {
                                 else { $orConds[] = ['eq', $om[1], $om[2]]; $valid = false; }
                             } elseif (preg_match('/^([a-zA-Z0-9_]+)\s*(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?|\'[^\']*\'|"[^"]*")$/s', $op, $om)) {
                                 $orConds[] = ['cmp', $om[1], $om[2], trim($om[3], "'\"")];
+                                $valid = false;
+                            } elseif (preg_match('/^([a-zA-Z0-9_]+)\s+NOT\s+LIKE\s+[\'"](.*?)[\'"]$/is', $op, $om)) {
+                                $orConds[] = ['not_like', $om[1], $om[2]];
+                                $valid = false;
+                            } elseif (preg_match('/^([a-zA-Z0-9_]+)\s+LIKE\s+[\'"](.*?)[\'"]$/is', $op, $om)) {
+                                $orConds[] = ['like', $om[1], $om[2]];
                                 $valid = false;
                             } else { $valid = false; break; }
                         }
@@ -3064,6 +3177,12 @@ namespace HtmlDatabase\Parser {
                         foreach ($group as $cond) {
                             if ($cond[0] === 'eq') {
                                 if ((string)($data[$cond[1]] ?? '') === (string)$cond[2]) { $any = true; break; }
+                            } elseif ($cond[0] === 'like') {
+                                $val = (string)($data[$cond[1]] ?? '');
+                                if (preg_match('/^' . $this->likeToRegex($cond[2]) . '$/is', $val)) { $any = true; break; }
+                            } elseif ($cond[0] === 'not_like') {
+                                $val = (string)($data[$cond[1]] ?? '');
+                                if (!preg_match('/^' . $this->likeToRegex($cond[2]) . '$/is', $val)) { $any = true; break; }
                             } elseif ($cond[0] === 'cmp') {
                                 $val = $data[$cond[1]] ?? '';
                                 $cv  = $cond[3];
@@ -3439,6 +3558,32 @@ namespace HtmlDatabase\Parser {
             // NULL literal
             if (strcasecmp($rhs, 'NULL') === 0) { $pairs[$col] = ''; return; }
 
+            // CASE WHEN col='v' THEN r WHEN ... [ELSE e] END — resolved per
+            // row at write time (wp_update_term_count_now / comment counts).
+            if (preg_match('/^CASE\b(.*)\bEND$/is', $rhs, $cm)) {
+                $cases = [];
+                $else  = null;
+                $body  = $cm[1];
+                // Split leading ELSE off the tail
+                if (preg_match('/\bELSE\b(.*)$/is', $body, $em)) {
+                    $else = trim($em[1]);
+                    $body = trim(substr($body, 0, strlen($body) - strlen($em[0])));
+                }
+                if (preg_match_all('/WHEN\s+([a-zA-Z0-9_]+)\s*=\s*(\'[^\']*\'|"[^"]*"|-?\d+(?:\.\d+)?)\s+THEN\s+(\'[^\']*\'|"[^"]*"|-?\d+(?:\.\d+)?)/is', $body, $wm, PREG_SET_ORDER)) {
+                    foreach ($wm as $w) {
+                        $cases[] = [
+                            'col'  => $w[1],
+                            'val'  => trim($w[2], "'\""),
+                            'then' => trim($w[3], "'\""),
+                        ];
+                    }
+                }
+                if (!empty($cases)) {
+                    $pairs[$col] = ['__case__' => ['cases' => $cases, 'else' => $else !== null ? trim($else, "'\"") : null]];
+                    return;
+                }
+            }
+
             // Date/time functions evaluated at write time
             if (preg_match('/^(NOW|CURRENT_TIMESTAMP|CURRENT_TIMESTAMP\(\)|CURRENT_DATE|CURDATE)\b\(*$/i', $rhs)) {
                 $pairs[$col] = gmdate('Y-m-d H:i:s');
@@ -3707,6 +3852,10 @@ namespace {
             if (!$this->ready) return false;
 
             $this->flush();
+
+            // Contract with wpdb: every statement passes through the 'query'
+            // filter (query monitors, debug bars, slow-query loggers).
+            $query = apply_filters('query', $query);
 
             // WordPress prepare() replaces literal % with a unique hash.
             $query = $this->remove_placeholder_escape($query);
