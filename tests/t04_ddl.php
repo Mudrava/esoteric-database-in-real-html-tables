@@ -72,4 +72,39 @@ check("SHOW COLUMNS has all 4", count(array_diff(['id','name','status','score'],
 $desc = $wpdb->get_results("DESCRIBE wp_where_test", ARRAY_A);
 check("DESCRIBE returns rows", count($desc) === 4);
 
+// 13. UNIQUE KEY parsed from CREATE TABLE and enforced by INSERT IGNORE
+$wpdb->query("DROP TABLE IF EXISTS wp_uniq_test");
+$wpdb->query("CREATE TABLE wp_uniq_test (
+    id bigint unsigned NOT NULL AUTO_INCREMENT,
+    slug varchar(100) NOT NULL,
+    site_id bigint unsigned NOT NULL DEFAULT 0,
+    label varchar(50) NOT NULL DEFAULT '',
+    PRIMARY KEY (id),
+    UNIQUE KEY slug_site (slug, site_id),
+    KEY label_idx (label)
+) ENGINE=InnoDB");
+$wpdb->query("INSERT INTO wp_uniq_test (slug, site_id, label) VALUES ('hello', 1, 'x')");
+$dup = $wpdb->query("INSERT IGNORE INTO wp_uniq_test (slug, site_id, label) VALUES ('hello', 1, 'y')");
+check("UNIQUE composite: duplicate skipped", (int)$dup === 0, "affected: " . var_export($dup, true));
+$other = $wpdb->query("INSERT IGNORE INTO wp_uniq_test (slug, site_id, label) VALUES ('hello', 2, 'z')");
+check("UNIQUE composite: different key inserts", (int)$other === 1, "affected: " . var_export($other, true));
+$n = (int) $wpdb->get_var("SELECT COUNT(*) FROM wp_uniq_test");
+check("UNIQUE table holds 2 rows", $n === 2, "count: $n");
+$lbl = $wpdb->get_var("SELECT label FROM wp_uniq_test WHERE slug='hello' AND site_id=1");
+check("UNIQUE clash left original row", $lbl === 'x', "label: " . var_export($lbl, true));
+
+// 14. DESCRIBE marks the unique column with UNI
+$dcols = $wpdb->get_results("DESCRIBE wp_uniq_test", ARRAY_A);
+$keys = [];
+foreach ($dcols as $dc) { $keys[$dc['Field']] = $dc['Key']; }
+check("DESCRIBE marks id as PRI", ($keys['id'] ?? '') === 'PRI', "got: " . var_export($keys['id'] ?? null, true));
+check("DESCRIBE marks slug as UNI", ($keys['slug'] ?? '') === 'UNI', "got: " . var_export($keys['slug'] ?? null, true));
+
+// 15. ALTER TABLE ADD UNIQUE KEY becomes effective
+$wpdb->query("ALTER TABLE wp_uniq_test ADD UNIQUE KEY label_u (label)");
+$dup2 = $wpdb->query("INSERT IGNORE INTO wp_uniq_test (slug, site_id, label) VALUES ('new', 9, 'x')");
+check("ALTER ADD UNIQUE enforced", (int)$dup2 === 0, "affected: " . var_export($dup2, true));
+
+$wpdb->query("DROP TABLE IF EXISTS wp_uniq_test");
+
 echo "\n=== t04: {$GLOBALS['pass']} passed, {$GLOBALS['fail']} failed ===\n";

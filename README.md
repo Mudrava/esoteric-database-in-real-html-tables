@@ -119,6 +119,10 @@ Supported SQL surface (the subset WordPress core and popular plugins emit):
 - `CASE WHEN` in `UPDATE`/`SELECT`
 - `JOIN` (INNER/LEFT, comma joins, multi-table) with join-condition routing
 - `INSERT` … `ON DUPLICATE KEY UPDATE` (upsert), multi-row `INSERT`
+- `INSERT IGNORE` with real unique-key enforcement: `UNIQUE KEY` definitions
+  from `CREATE TABLE`/`ALTER TABLE` are parsed into `_schema.json`, and
+  colliding rows are skipped with 0 affected rows (core option locks -
+  `WP_Upgrader::create_lock()` and friends - depend on this)
 - `REPLACE INTO`, `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `TRUNCATE`, `SHOW TABLES`, `DESCRIBE`
 - `SET`/`START TRANSACTION`/`COMMIT`/`ROLLBACK` are accepted as no-ops (single-statement atomicity only)
 
@@ -146,27 +150,28 @@ Supported SQL surface (the subset WordPress core and popular plugins emit):
 ## Requirements
 
 - PHP 8.1+ (`readonly` properties, `match`, `str_starts_with`/`str_ends_with`)
-- WordPress 6.x
+- WordPress 6.x or 7.x (verified live: the bench updates core 6.9 -> 7.1.3
+  through the engine, including the `dbDelta` schema migration)
 - A POSIX-compatible filesystem (for `rename()` atomicity and `flock()`)
 
 ---
 
 ## Tests
 
-A Docker bench with a real WordPress 6 (plus ACF and Elementor) runs the full
+A Docker bench with a real WordPress (plus ACF and Elementor) runs the full
 suite against the engine:
 
 ```bash
-./tests/run.sh        # all suites (88 checks)
+./tests/run.sh        # all suites (102 checks)
 ./tests/run.sh t02    # one suite
 ```
 
 | Suite | Covers |
 |---|---|
-| `t01_basic` | CRUD, prepare, transients, cron, comments, arithmetic UPDATE |
+| `t01_basic` | CRUD, prepare, transients, cron, comments, arithmetic UPDATE, `INSERT IGNORE` locks |
 | `t02_content` | posts, taxonomies, menus, templates, UTF-8/emoji round-trip |
 | `t03_plugins` | ACF fields, Elementor data, REST API |
-| `t04_ddl` | CREATE/ALTER/DROP, DESCRIBE, SHOW TABLES, schema persistence |
+| `t04_ddl` | CREATE/ALTER/DROP, DESCRIBE, SHOW TABLES, schema persistence, UNIQUE keys |
 
 `bench_perf.php` / `bench_scale.php` measure insert throughput, PK-read
 latency and scan cost. The bench mounts `db.php` live, so engine edits are

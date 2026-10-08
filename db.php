@@ -955,7 +955,7 @@ HTML;
          * Returns null when no schema has been recorded (core tables created
          * before schema persistence, or implicit tables).
          *
-         * @return array{pk:?string,auto:?string,columns:array<string,array>,defaults:array<string,string>}|null
+         * @return array{pk:?string,auto:?string,columns:array<string,array>,defaults:array<string,string>,unique:string[][]}|null
          */
         public function readSchema(string $table): ?array
         {
@@ -966,7 +966,7 @@ HTML;
             if (file_exists($path)) {
                 $decoded = json_decode((string) @file_get_contents($path), true);
                 if (is_array($decoded) && isset($decoded['columns'])) {
-                    $decoded += ['pk' => null, 'auto' => null, 'defaults' => []];
+                    $decoded += ['pk' => null, 'auto' => null, 'defaults' => [], 'unique' => []];
                     $this->schemaCache[$table] = $decoded;
                     return $decoded;
                 }
@@ -981,7 +981,7 @@ HTML;
         public function writeSchema(string $table, array $schema): void
         {
             $this->ensureTable($table);
-            $schema += ['pk' => null, 'auto' => null, 'columns' => [], 'defaults' => []];
+            $schema += ['pk' => null, 'auto' => null, 'columns' => [], 'defaults' => [], 'unique' => []];
             $path = $this->router->schemaPath($table);
             $tmp  = $path . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
             @file_put_contents($tmp, json_encode($schema, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX);
@@ -2143,13 +2143,15 @@ namespace HtmlDatabase\Parser {
      *  - Nested parentheses inside values (serialised PHP arrays, JSON, etc.).
      *  - Single-quote escaping via backslash and doubled single-quotes.
      *  - Strips ON DUPLICATE KEY UPDATE clause on the fly.
+     *  - Statement modifiers: IGNORE (duplicate rows skipped), LOW_PRIORITY,
+     *    HIGH_PRIORITY, DELAYED (accepted, no semantic effect).
      */
     final class InsertTokenizer
     {
         /**
          * Parse a full INSERT statement.
          *
-         * @return array{table: string, columns: string[], rows: array[]}|null
+         * @return array{table: string, columns: string[], rows: array[], onDuplicate: ?array, ignore: bool}|null
          */
         public function tokenize(string $sql): ?array
         {
@@ -2162,7 +2164,21 @@ namespace HtmlDatabase\Parser {
             $onDup = $this->extractOnDuplicate($sql);
             $sql = $this->stripOnDuplicate($sql);
 
-            // 3. Extract table name
+            // 3. Statement modifiers between INSERT and the table name.
+            //    IGNORE carries semantics: rows colliding with a unique key
+            //    are skipped instead of failing. Core uses it for option
+            //    locks (WP_Upgrader::create_lock, taxonomy/comment locks).
+            $ignore = false;
+            $sql = preg_replace_callback(
+                '/^INSERT\s+((?:(?:LOW_PRIORITY|HIGH_PRIORITY|DELAYED|IGNORE)\s+)+)/i',
+                function (array $m) use (&$ignore): string {
+                    if (stripos($m[1], 'IGNORE') !== false) $ignore = true;
+                    return 'INSERT ';
+                },
+                $sql
+            ) ?? $sql;
+
+            // 4. Extract table name
             if (!preg_match('/INSERT\s+(?:INTO\s+)?[`]?([a-zA-Z0-9_]+)[`]?\s*\(/i', $sql, $m)) {
                 return null;
             }
@@ -2207,7 +2223,7 @@ namespace HtmlDatabase\Parser {
                 return null;
             }
 
-            return ['table' => $table, 'columns' => $columns, 'rows' => $rows, 'onDuplicate' => $onDup];
+            return ['table' => $table, 'columns' => $columns, 'rows' => $rows, 'onDuplicate' => $onDup, 'ignore' => $ignore];
         }
 
         private function extractParenGroup(string $sql, int $startPos): ?array
@@ -4374,6 +4390,39 @@ namespace {
             'options' => ['autoload' => 'yes'],
         ];
 
+        /**
+         * Unique keys of WordPress core tables, mirroring the UNIQUE
+         * declarations in wp-admin/includes/schema.php. Core tables are
+         * created by wp_install_defaults through this engine without a
+         * CREATE TABLE we can parse (dbDelta path varies by version), so
+         * the contract is mirrored here. Plugin tables get their unique
+         * sets from parsed CREATE TABLE / ALTER TABLE instead.
+         */
+        private const CORE_UNIQUE = [
+            'options'       => [['option_name']],
+            'term_taxonomy' => [['term_id', 'taxonomy']],
+        ];
+
+        /**
+         * Unique key column sets enforced for a table: parsed schema first,
+         * core mirror as fallback.
+         *
+         * @return string[][]
+         */
+        private function uniqueKeysFor(string $table): array
+        {
+            $schema = $this->storage->readSchema($table);
+            $sets = $schema['unique'] ?? [];
+            if ($sets === []) {
+                foreach (self::CORE_UNIQUE as $suffix => $coreSets) {
+                    if ($table === $suffix || str_ends_with($table, '_' . $suffix)) {
+                        return $coreSets;
+                    }
+                }
+            }
+            return $sets;
+        }
+
         private function resolveColumnDefaults(string $table): array
         {
             $defaults = [];
@@ -4416,6 +4465,7 @@ namespace {
             $columns = $parsed['columns'];
             $rows    = $parsed['rows'];
             $onDup   = $parsed['onDuplicate'] ?? null;
+            $ignore  = (bool) ($parsed['ignore'] ?? false);
 
             // URL Safeguard
             $rows = $this->applySiteurlSafeguard($table, $columns, $rows);
@@ -4428,6 +4478,48 @@ namespace {
                         $columns[] = $defCol;
                         foreach ($rows as &$row) { $row[] = $defVal; }
                         unset($row);
+                    }
+                }
+            }
+
+            // INSERT IGNORE: drop rows that collide with an existing unique
+            // key (PRIMARY KEY, schema-declared UNIQUE, or core-mirrored).
+            // MySQL skips them with no error and returns 0 affected rows,
+            // which is exactly what WP_Upgrader::create_lock() and the
+            // taxonomy/comment locks test to detect that another process
+            // already holds the option lock. Runs before auto-increment so
+            // skipped rows never burn sequence values.
+            if ($ignore) {
+                $uniqueSets = $this->uniqueKeysFor($table);
+                $pkForCheck = $this->resolveAutoPkColumn($table);
+                if ($pkForCheck !== null) {
+                    $uniqueSets[] = [$pkForCheck];
+                }
+                if ($uniqueSets !== []) {
+                    $kept = [];
+                    foreach ($rows as $row) {
+                        $conflict = false;
+                        foreach ($uniqueSets as $set) {
+                            $conds = [];
+                            $complete = true;
+                            foreach ($set as $uc) {
+                                $idx = array_search($uc, $columns, true);
+                                if ($idx === false) { $complete = false; break; }
+                                $conds[$uc] = (string) ($row[$idx] ?? '');
+                            }
+                            if (!$complete) continue;
+                            if ($this->storage->findMatchingRows($table, $conds) !== []) {
+                                $conflict = true;
+                                break;
+                            }
+                        }
+                        if (!$conflict) $kept[] = $row;
+                    }
+                    $rows = $kept;
+                    if ($rows === []) {
+                        $this->rows_affected = 0;
+                        $this->insert_id = 0;
+                        return 0;
                     }
                 }
             }
@@ -4627,6 +4719,17 @@ namespace {
                     if (($existing['auto'] ?? null) !== null && $schema['auto'] === null) {
                         $schema['auto'] = $existing['auto'];
                     }
+                    // Union unique sets: dbDelta re-runs must not lose keys
+                    // declared earlier (or added via ALTER).
+                    $mergedUnique = $existing['unique'] ?? [];
+                    foreach ($schema['unique'] ?? [] as $uset) {
+                        $known = false;
+                        foreach ($mergedUnique as $eu) {
+                            if (implode(',', $eu) === implode(',', $uset)) { $known = true; break; }
+                        }
+                        if (!$known) $mergedUnique[] = $uset;
+                    }
+                    $schema['unique'] = $mergedUnique;
                 }
                 $this->storage->writeSchema($table, $schema);
                 return true;
@@ -4679,7 +4782,7 @@ namespace {
          */
         private function parseCreateTableBody(string $body): array
         {
-            $schema = ['pk' => null, 'auto' => null, 'columns' => [], 'defaults' => []];
+            $schema = ['pk' => null, 'auto' => null, 'columns' => [], 'defaults' => [], 'unique' => []];
 
             foreach ($this->splitTopLevel($body) as $def) {
                 $def = trim($def);
@@ -4689,6 +4792,15 @@ namespace {
                 if (preg_match('/^PRIMARY\s+KEY\s*\(([^)]*)\)/i', $def, $pm)) {
                     $cols = array_map(fn($c) => trim($c, " \t`"), explode(',', $pm[1]));
                     $schema['pk'] = $cols[0] ?? null; // composite: first column drives rowKey
+                    continue;
+                }
+                // UNIQUE KEY name (cols) / UNIQUE (cols): drives INSERT
+                // IGNORE duplicate detection. Core declares option_name
+                // and (term_id,taxonomy) this way.
+                if (preg_match('/^UNIQUE\s+(?:KEY\s+|INDEX\s+)?(?:`?[a-zA-Z0-9_]+`?\s*)?\(([^)]*)\)/i', $def, $um)) {
+                    $cols = array_map(fn($c) => trim($c, " \t`"), explode(',', $um[1]));
+                    $cols = array_values(array_filter($cols, fn($c) => $c !== ''));
+                    if ($cols !== []) $schema['unique'][] = $cols;
                     continue;
                 }
                 if (preg_match('/^(UNIQUE\s+)?(KEY|INDEX|FULLTEXT|SPATIAL|CONSTRAINT|FOREIGN\s+KEY|CHECK)\b/i', $def)) {
@@ -4705,6 +4817,9 @@ namespace {
 
                 $schema['columns'][$col] = ['type' => $type];
 
+                if (preg_match('/\bUNIQUE\b/i', $rest) && $col !== ($schema['pk'] ?? '')) {
+                    $schema['unique'][] = [$col]; // inline column UNIQUE
+                }
                 if (preg_match('/\bAUTO_INCREMENT\b/i', $rest)) {
                     $schema['auto'] = $col;
                     if ($schema['pk'] === null) $schema['pk'] = $col;
@@ -4741,12 +4856,24 @@ namespace {
                     $cols[$c] = ['type' => 'longtext'];
                 }
                 $pk = $this->storage->resolvePkColumn($table);
-                $schema = ['pk' => $pk, 'auto' => $pk, 'columns' => $cols, 'defaults' => []];
+                $schema = ['pk' => $pk, 'auto' => $pk, 'columns' => $cols, 'defaults' => [], 'unique' => []];
             }
 
             foreach ($this->splitTopLevel($actions) as $action) {
                 $action = trim($action);
                 if ($action === '') continue;
+
+                // ADD [UNIQUE] KEY/INDEX must be consumed before the
+                // ADD COLUMN branch, otherwise the index name is parsed
+                // as a column definition.
+                if (preg_match('/^ADD\s+(UNIQUE\s+)?(?:KEY|INDEX)\s*(?:`?[a-zA-Z0-9_]+`?\s*)?\(([^)]*)\)/i', $action, $um)) {
+                    if (!empty($um[1])) {
+                        $cols = array_map(fn($c) => trim($c, " \t`"), explode(',', $um[2]));
+                        $cols = array_values(array_filter($cols, fn($c) => $c !== ''));
+                        if ($cols !== []) $schema['unique'][] = $cols;
+                    }
+                    continue;
+                }
 
                 if (preg_match('/^ADD\s+(?:COLUMN\s+)?\(?`?([a-zA-Z0-9_]+)`?\s+([a-zA-Z]+(?:\s*\([^)]*\))?)/i', $action, $am)) {
                     $col = $am[1];
@@ -4769,10 +4896,17 @@ namespace {
                     }
                     continue;
                 }
+                if (preg_match('/^DROP\s+(?:INDEX|KEY)\b/i', $action)) {
+                    continue; // index names are not tracked; nothing to remove
+                }
                 if (preg_match('/^DROP\s+(?:COLUMN\s+)?`?([a-zA-Z0-9_]+)`?/i', $action, $dm)) {
                     unset($schema['columns'][$dm[1]], $schema['defaults'][$dm[1]]);
                     if (($schema['pk'] ?? null) === $dm[1]) $schema['pk'] = null;
                     if (($schema['auto'] ?? null) === $dm[1]) $schema['auto'] = null;
+                    $schema['unique'] = array_values(array_filter(
+                        $schema['unique'] ?? [],
+                        fn(array $set): bool => !in_array($dm[1], $set, true)
+                    ));
                     continue;
                 }
                 if (preg_match('/^CHANGE\s+(?:COLUMN\s+)?`?([a-zA-Z0-9_]+)`?\s+`?([a-zA-Z0-9_]+)`?/i', $action, $cm)) {
@@ -4833,10 +4967,14 @@ namespace {
             if (preg_match('/SHOW\s+COLUMNS\s+FROM\s+([a-zA-Z0-9_]+)/i', $sql, $cm)) {
                 $schema = $this->storage->readSchema($cm[1]);
                 $cols = $this->storage->listColumns($cm[1]);
+                $uniqueCols = [];
+                foreach ($schema['unique'] ?? [] as $uset) {
+                    foreach ($uset as $uc) $uniqueCols[$uc] = true;
+                }
                 foreach ($cols as $col) {
                     $type  = $schema['columns'][$col]['type'] ?? 'longtext';
                     $extra = (($schema['auto'] ?? null) === $col) ? 'auto_increment' : '';
-                    $key   = (($schema['pk'] ?? null) === $col) ? 'PRI' : '';
+                    $key   = (($schema['pk'] ?? null) === $col) ? 'PRI' : (isset($uniqueCols[$col]) ? 'UNI' : '');
                     $def   = $schema['defaults'][$col] ?? null;
                     $this->last_result[] = (object) [
                         'Field' => $col, 'Type' => $type, 'Null' => 'YES',
@@ -4870,10 +5008,14 @@ namespace {
 
             if (preg_match('/^(?:DESCRIBE|DESC)\s+([a-zA-Z0-9_]+)/i', trim($sql), $m)) {
                 $schema = $this->storage->readSchema($m[1]);
+                $uniqueCols = [];
+                foreach ($schema['unique'] ?? [] as $uset) {
+                    foreach ($uset as $uc) $uniqueCols[$uc] = true;
+                }
                 foreach ($this->storage->listColumns($m[1]) as $col) {
                     $type  = $schema['columns'][$col]['type'] ?? 'longtext';
                     $extra = (($schema['auto'] ?? null) === $col) ? 'auto_increment' : '';
-                    $key   = (($schema['pk'] ?? null) === $col) ? 'PRI' : '';
+                    $key   = (($schema['pk'] ?? null) === $col) ? 'PRI' : (isset($uniqueCols[$col]) ? 'UNI' : '');
                     $def   = $schema['defaults'][$col] ?? null;
                     $this->last_result[] = (object) [
                         'Field' => $col, 'Type' => $type, 'Null' => 'YES',

@@ -170,4 +170,31 @@ $wpdb->query("UPDATE {$wpdb->term_taxonomy} SET count = count + 5 WHERE term_id=
 $cv = $wpdb->get_var($wpdb->prepare("SELECT count FROM {$wpdb->term_taxonomy} WHERE term_id=%d", $cat['term_id']));
 check('arithmetic UPDATE count+5', is_numeric($cv), "stored: " . var_export($cv, true));
 
+// -- 21. INSERT IGNORE on options (core lock pattern) -------------------------------------------
+// WP_Upgrader::create_lock() / taxonomy / comment locks all use
+// "INSERT IGNORE INTO options (option_name, ...)". option_name is UNIQUE,
+// so the second insert must affect 0 rows (lock held) without erroring.
+$wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name = 't01_lock'");
+$first = $wpdb->query("INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES ('t01_lock', '111', 'off')");
+check('INSERT IGNORE first row affects 1', (int)$first === 1, "affected: " . var_export($first, true));
+$second = $wpdb->query("INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES ('t01_lock', '222', 'off')");
+check('INSERT IGNORE duplicate affects 0', (int)$second === 0, "affected: " . var_export($second, true));
+$lockVal = $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name=%s", 't01_lock'));
+check('duplicate did not overwrite value', $lockVal === '111', "value: " . var_export($lockVal, true));
+$lockRows = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name=%s", 't01_lock'));
+check('still exactly one row', (int)$lockRows === 1, "rows: " . var_export($lockRows, true));
+$wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name = 't01_lock'");
+
+// -- 22. INSERT IGNORE multi-row (partial skip) -------------------------------------------------
+$wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name IN ('t01_mi_a','t01_mi_b','t01_mi_c')");
+$wpdb->query("INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES ('t01_mi_a', 'a', 'off')");
+// b and c are new; a collides. MySQL inserts the 2 new rows, skips a.
+$aff = $wpdb->query("INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES ('t01_mi_a','a2','off'),('t01_mi_b','b','off'),('t01_mi_c','c','off')");
+check('INSERT IGNORE multi-row skips only the clash', (int)$aff === 2, "affected: " . var_export($aff, true));
+$keptA = $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name=%s", 't01_mi_a'));
+check('multi-row: existing row untouched', $keptA === 'a', "a=" . var_export($keptA, true));
+$newB = $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name=%s", 't01_mi_b'));
+check('multi-row: new row inserted', $newB === 'b', "b=" . var_export($newB, true));
+$wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name IN ('t01_mi_a','t01_mi_b','t01_mi_c')");
+
 echo "\n== T01: $PASS passed, $FAIL failed ==\n";
