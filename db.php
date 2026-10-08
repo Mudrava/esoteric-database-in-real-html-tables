@@ -39,13 +39,13 @@ namespace HtmlDatabase\Core {
     /**
      * Immutable runtime configuration.
      */
-    final readonly class Configuration
+    final class Configuration
     {
         /** Maximum rows per chunk file. */
-        public int $chunkSize;
+        public readonly int $chunkSize;
 
         /** Number of WAL entries before inline compaction triggers. */
-        public int $compactThreshold;
+        public readonly int $compactThreshold;
 
         public function __construct(
             public string $basePath,
@@ -2926,7 +2926,7 @@ namespace {
 
         // -- DDL --------------------------------------------------------------
 
-        private function handleDdl(string $sql): true { return true; }
+        private function handleDdl(string $sql): bool { return true; }
 
         // -- SHOW / DESCRIBE --------------------------------------------------
 
