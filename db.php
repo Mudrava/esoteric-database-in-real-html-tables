@@ -2136,6 +2136,45 @@ namespace HtmlDatabase\Parser {
     use HtmlDatabase\Core\ShardedStorageManager;
 
     /**
+     * Strip table/alias prefixes (wp_posts.ID -> ID, t.* -> *) from a SQL
+     * fragment WITHOUT touching quoted string literals.
+     *
+     * A naive regex over the whole statement mangles dotted values that live
+     * inside quotes - "option_name='core_updater.lock'" would become
+     * "option_name='lock'" and the row could never be found again. So quoted
+     * spans are lifted out behind placeholders, prefixes are stripped from
+     * the bare skeleton, and the literals are restored verbatim afterwards.
+     */
+    function stripTablePrefixes(string $sql): string
+    {
+        $literals = [];
+        $skeleton = preg_replace_callback(
+            "/'(?:\\\\.|[^'\\\\])*'|\"(?:\\\\.|[^\"\\\\])*\"/",
+            static function (array $m) use (&$literals): string {
+                $literals[] = $m[0];
+                return "\x01" . (count($literals) - 1) . "\x02";
+            },
+            $sql
+        );
+        if ($skeleton === null) {
+            return $sql;
+        }
+
+        $skeleton = preg_replace('/\b[a-zA-Z0-9_]+\.\*/', '*', $skeleton);
+        $skeleton = preg_replace('/\b[a-zA-Z0-9_]+\.([a-zA-Z0-9_]+)/', '$1', $skeleton);
+
+        if ($literals !== []) {
+            $skeleton = preg_replace_callback(
+                '/\x01(\d+)\x02/',
+                static fn (array $m): string => $literals[(int) $m[1]] ?? $m[0],
+                $skeleton
+            );
+        }
+
+        return $skeleton;
+    }
+
+    /**
      * Character-level state-machine tokenizer for SQL INSERT statements.
      *
      * Handles:
@@ -2626,12 +2665,11 @@ namespace HtmlDatabase\Parser {
                 }
             }
 
-            // Strip table/alias prefixes: wp_posts.* → *, wp_posts.ID → ID
-            $sql = preg_replace('/\b[a-zA-Z0-9_]+\.\*/', '*', $sql);
-            $sql = preg_replace('/\b[a-zA-Z0-9_]+\.([a-zA-Z0-9_]+)/', '$1', $sql);
+            // Strip table/alias prefixes: wp_posts.* → *, wp_posts.ID → ID.
+            // Quoted literals are protected so dotted values survive.
+            $sql = stripTablePrefixes($sql);
             if ($rawWhere !== null) {
-                $rawWhere = preg_replace('/\b[a-zA-Z0-9_]+\.\*/', '*', $rawWhere);
-                $rawWhere = preg_replace('/\b[a-zA-Z0-9_]+\.([a-zA-Z0-9_]+)/', '$1', $rawWhere);
+                $rawWhere = stripTablePrefixes($rawWhere);
             }
 
             // Columns: normalize "expr AS alias" to the alias, drop function
@@ -3889,7 +3927,7 @@ namespace HtmlDatabase\Parser {
             $conditions = [];
             if (trim($clause) === '') return $conditions;
 
-            $clause = preg_replace('/\b[a-zA-Z0-9_]+\.([a-zA-Z0-9_]+)/', '$1', $clause);
+            $clause = stripTablePrefixes($clause);
 
             $parts = $this->splitAndRespectingBetween($clause);
             foreach ($parts as $part) {

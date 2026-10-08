@@ -197,4 +197,55 @@ $newB = $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options}
 check('multi-row: new row inserted', $newB === 'b', "b=" . var_export($newB, true));
 $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name IN ('t01_mi_a','t01_mi_b','t01_mi_c')");
 
+// -- 23. dotted option names (core_updater.lock round-trip) -------------------
+// Prefix stripping must not reach inside quoted literals: a naive
+// wp_x.col -> col regex turns 'core_updater.lock' into 'lock', which leaks
+// lock rows (DELETE matches nothing) and then wedges create_lock() forever.
+$dot = 't01.dot.name';
+$wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name = '$dot'");
+
+$wpdb->query("INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES ('$dot', 'v1', 'off')");
+$sel = $wpdb->get_var("SELECT option_value FROM {$wpdb->options} WHERE option_name = '$dot'");
+check('dotted name: raw SELECT finds row', $sel === 'v1', "value: " . var_export($sel, true));
+
+$cnt = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name = '$dot'");
+check('dotted name: COUNT matches 1', (int)$cnt === 1, "count: " . var_export($cnt, true));
+
+// UPDATE ... WHERE option_name = 'a.b' (release-style mutation path)
+$wpdb->query("UPDATE {$wpdb->options} SET option_value = 'v2' WHERE option_name = '$dot'");
+$upd = $wpdb->get_var("SELECT option_value FROM {$wpdb->options} WHERE option_name = '$dot'");
+check('dotted name: UPDATE hits row', $upd === 'v2', "value: " . var_export($upd, true));
+
+// DELETE ... WHERE option_name = 'a.b' must actually remove the row.
+$wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name = '$dot'");
+$gone = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name = '$dot'");
+check('dotted name: DELETE removes row', (int)$gone === 0, "count: " . var_export($gone, true));
+
+// Full core lock cycle: acquire (INSERT IGNORE), fail re-acquire, release
+// (DELETE), re-acquire must succeed again. This is do-core-reinstall.
+$lock = 'core_updater.lock';
+$wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name = '$lock'");
+$a1 = $wpdb->query("INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES ('$lock', '111', 'off')");
+check('lock: first acquire affects 1', (int)$a1 === 1, "affected: " . var_export($a1, true));
+$a2 = $wpdb->query("INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES ('$lock', '222', 'off')");
+check('lock: second acquire affects 0', (int)$a2 === 0, "affected: " . var_export($a2, true));
+$wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name = '$lock'");
+$left = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name = '$lock'");
+check('lock: release DELETE really removes it', (int)$left === 0, "count: " . var_export($left, true));
+$a3 = $wpdb->query("INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES ('$lock', '333', 'off')");
+check('lock: re-acquire after release affects 1', (int)$a3 === 1, "affected: " . var_export($a3, true));
+$wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name = '$lock'");
+
+// get_option / update_option / delete_option API path with a dotted name.
+delete_option('t01.dot.opt');
+add_option('t01.dot.opt', 'api-v', '', 'no');
+check('dotted name: get_option round-trip', get_option('t01.dot.opt') === 'api-v',
+    'got: ' . var_export(get_option('t01.dot.opt'), true));
+update_option('t01.dot.opt', 'api-v2');
+check('dotted name: update_option works', get_option('t01.dot.opt') === 'api-v2',
+    'got: ' . var_export(get_option('t01.dot.opt'), true));
+delete_option('t01.dot.opt');
+check('dotted name: delete_option works', get_option('t01.dot.opt') === false,
+    'got: ' . var_export(get_option('t01.dot.opt'), true));
+
 echo "\n== T01: $PASS passed, $FAIL failed ==\n";
