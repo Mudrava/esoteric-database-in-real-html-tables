@@ -1,7 +1,7 @@
 name: Bug report
-about: Something does not work as documented
+description: Something does not work as documented
 title: "[bug] "
-labels: bug
+labels: [bug]
 body:
   - type: markdown
     attributes:

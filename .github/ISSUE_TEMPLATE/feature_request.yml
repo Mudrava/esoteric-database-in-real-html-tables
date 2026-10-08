@@ -1,7 +1,7 @@
 name: Feature request
-about: An improvement to the engine, bench, or docs
+description: An improvement to the engine, bench, or docs
 title: "[feat] "
-labels: enhancement
+labels: [enhancement]
 body:
   - type: markdown
     attributes:
