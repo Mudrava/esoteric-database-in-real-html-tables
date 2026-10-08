@@ -162,13 +162,13 @@ A Docker bench with a real WordPress (plus ACF and Elementor) runs the full
 suite against the engine:
 
 ```bash
-./tests/run.sh        # all suites (102 checks)
+./tests/run.sh        # all suites (113 checks)
 ./tests/run.sh t02    # one suite
 ```
 
 | Suite | Covers |
 |---|---|
-| `t01_basic` | CRUD, prepare, transients, cron, comments, arithmetic UPDATE, `INSERT IGNORE` locks |
+| `t01_basic` | CRUD, prepare, transients, cron, comments, arithmetic UPDATE, `INSERT IGNORE` locks, dotted option names |
 | `t02_content` | posts, taxonomies, menus, templates, UTF-8/emoji round-trip |
 | `t03_plugins` | ACF fields, Elementor data, REST API |
 | `t04_ddl` | CREATE/ALTER/DROP, DESCRIBE, SHOW TABLES, schema persistence, UNIQUE keys |
