@@ -2566,6 +2566,7 @@ namespace HtmlDatabase\Parser {
             $nullConditions   = [];
             $notNullConditions = [];
             $betweenConditions = []; // [ ['col'=>..,'not'=>bool,'low'=>..,'high'=>..], ... ]
+            $funcConditions   = []; // [ ['fn'=>YEAR,'col'=>..,'op'=>'=','val'=>N], ... ]
             $orGroups         = []; // list of disjunctions: [ [cond, cond...], ... ]
 
             if ($rawWhere !== null) {
@@ -2591,6 +2592,7 @@ namespace HtmlDatabase\Parser {
                                 'notInConditions' => [], 'comparisons' => [],
                                 'likeConditions' => [], 'notLikeConditions' => [],
                                 'nullConditions' => [], 'notNullConditions' => [],
+                                'funcConditions' => [],
                                 'orGroups' => [], 'joins' => [], 'joinFilters' => [],
                                 'aggregates' => [], 'distinct' => false,
                                 'mainAlias' => $mainAlias, 'selectQualified' => [],
@@ -2601,6 +2603,14 @@ namespace HtmlDatabase\Parser {
                                 'calcFoundRows' => $calcFoundRows,
                             ];
                         }
+                        continue;
+                    }
+
+                    // Date function conditions: YEAR(col) = N, MONTH(col) >= N ...
+                    // Must be tested before plain "col = N" which would otherwise
+                    // capture the column inside the function call.
+                    if (preg_match('/^(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND|WEEK|QUARTER)\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*(=|!=|<>|>=|<=|>|<)\s*(-?\d+)$/si', $part, $fn)) {
+                        $funcConditions[] = ['fn' => strtoupper($fn[1]), 'col' => $fn[2], 'op' => $fn[3], 'val' => (int) $fn[4]];
                         continue;
                     }
 
@@ -2750,6 +2760,7 @@ namespace HtmlDatabase\Parser {
                 'nullConditions'    => $nullConditions,
                 'notNullConditions' => $notNullConditions,
                 'betweenConditions' => $betweenConditions,
+                'funcConditions'    => $funcConditions,
                 'orGroups'          => $orGroups,
                 'joins'             => $joins,
                 'joinFilters'       => $joinFilters,
@@ -3022,7 +3033,14 @@ namespace HtmlDatabase\Parser {
                         if ($ok) $matched[] = $c;
                     }
                     if (empty($matched)) {
-                        if ($spec['left']) { $next[] = $prow; }
+                        // A LEFT JOIN keeps the row NULL-extended, but a WHERE
+                        // filter on that alias then rejects NULL — matching MySQL,
+                        // which effectively turns such a LEFT JOIN into INNER.
+                        $filteredAlias = false;
+                        foreach ($parsed['joinFilters'] as $jf) {
+                            if ($jf['alias'] === $alias) { $filteredAlias = true; break; }
+                        }
+                        if ($spec['left'] && !$filteredAlias) { $next[] = $prow; }
                         continue;
                     }
                     foreach ($matched as $m) { $next[] = array_merge($prow, $m); }
@@ -3106,6 +3124,35 @@ namespace HtmlDatabase\Parser {
                             $match = false;
                             break;
                         }
+                    }
+                }
+
+                // Date function conditions: YEAR(post_date) = 2025 etc
+                if ($match) {
+                    foreach ($parsed['funcConditions'] ?? [] as $fc) {
+                        $raw = (string)($data[$fc['col']] ?? '');
+                        $ts = $raw === '' ? false : strtotime($raw);
+                        if ($ts === false) {
+                            $extracted = 0;
+                        } elseif ($fc['fn'] === 'QUARTER') {
+                            $extracted = (int) ceil(((int) date('n', $ts)) / 3);
+                        } else {
+                            $extracted = (int) date([
+                                'YEAR' => 'Y', 'MONTH' => 'n', 'DAY' => 'j',
+                                'HOUR' => 'G', 'MINUTE' => 'i', 'SECOND' => 's',
+                                'WEEK' => 'W',
+                            ][$fc['fn']], $ts);
+                        }
+                        $ok = match ($fc['op']) {
+                            '='  => $extracted === $fc['val'],
+                            '!=', '<>' => $extracted !== $fc['val'],
+                            '>'  => $extracted > $fc['val'],
+                            '>=' => $extracted >= $fc['val'],
+                            '<'  => $extracted < $fc['val'],
+                            '<=' => $extracted <= $fc['val'],
+                            default => true,
+                        };
+                        if (!$ok) { $match = false; break; }
                     }
                 }
 
@@ -3219,7 +3266,11 @@ namespace HtmlDatabase\Parser {
                 }
                 $grouped = [];
                 foreach ($groups as $g) {
-                    $row = [];
+                    // MySQL (without ONLY_FULL_GROUP_BY) returns every selected
+                    // column from an arbitrary row of the group; seed with the
+                    // first row so SELECT * keeps all columns, then layer the
+                    // group keys and aggregates on top.
+                    $row = $g['first'];
                     foreach ($parsed['groupBy'] as $gc) { $row[$gc] = $g['first'][$gc] ?? ''; }
                     foreach ($parsed['aggregates'] as $ag) {
                         $row[$ag['alias']] = $this->computeAggregate($ag, $g['rows']);
@@ -3922,8 +3973,12 @@ namespace {
                 return 1;
             }
 
-            // YEAR() / MONTH() / DAY() aggregate: SELECT DISTINCT YEAR(col) AS y, MONTH(col) AS m FROM ...
-            if (preg_match('/\b(YEAR|MONTH|DAY)\s*\(/i', $sql)) {
+            // YEAR() / MONTH() / DAY() in the SELECT list only (archive
+            // widgets: SELECT DISTINCT YEAR(col) AS y ... FROM ...). When the
+            // function appears solely in WHERE, the translator evaluates it
+            // via funcConditions instead.
+            $selectList = preg_match('/\bSELECT\b(.*?)\bFROM\b/is', $sql, $slm) ? $slm[1] : '';
+            if ($selectList !== '' && preg_match('/\b(YEAR|MONTH|DAY)\s*\(/i', $selectList)) {
                 return $this->handleDateFunctions($sql);
             }
 
