@@ -111,8 +111,8 @@ namespace HtmlDatabase\Core {
          */
         public function resolveChunks(string $tableDir, ?string $pkCol, array $conditions): array
         {
-            // If we have a PK equality condition, narrow to one chunk
-            if ($pkCol !== null && isset($conditions[$pkCol])) {
+            // If we have a scalar PK equality condition, narrow to one chunk
+            if ($pkCol !== null && isset($conditions[$pkCol]) && !is_array($conditions[$pkCol])) {
                 $pkVal = (int) $conditions[$pkCol];
                 if ($pkVal > 0) {
                     $chunk = $this->chunkForPk($pkVal);
@@ -497,19 +497,29 @@ HTML;
 
             // We need to find matching rows to know which PKs to update.
             // Read from chunks + WAL, apply conditions, get PKs.
-            $pkCol = $this->resolvePkColumn($table);
             $matchingRows = $this->findMatchingRows($table, $conditions);
 
             if (empty($matchingRows)) {
-                // WP expects update to return 1 even when 0 rows matched in some contexts
-                return 1;
+                return 0;
             }
 
             $html = '';
             foreach ($matchingRows as $row) {
-                $pk = $pkCol !== null ? ((string) ($row[$pkCol] ?? '0')) : '0';
+                // Resolve arithmetic deltas against the current row value
+                $resolved = [];
+                foreach ($setValues as $col => $val) {
+                    if (is_array($val) && array_key_exists('__delta__', $val)) {
+                        $sum = ((float) ($row[$col] ?? 0)) + $val['__delta__'];
+                        $resolved[$col] = (fmod($sum, 1.0) === 0.0)
+                            ? (string) (int) $sum
+                            : (string) $sum;
+                    } else {
+                        $resolved[$col] = $val;
+                    }
+                }
+                $pk = $this->rowKey($table, $row);
                 // Merge: existing row data + set values (set values override)
-                $merged = array_merge($row, $setValues);
+                $merged = array_merge($row, $resolved);
                 $html .= $this->buildWalEntry($merged, 'update', $txId, $pk);
             }
 
@@ -530,7 +540,6 @@ HTML;
         public function deleteRows(string $table, array $conditions, int $txId): int
         {
             $this->router->ensureTableDir($table);
-            $pkCol = $this->resolvePkColumn($table);
             $matchingRows = $this->findMatchingRows($table, $conditions);
 
             if (empty($matchingRows)) {
@@ -539,7 +548,7 @@ HTML;
 
             $html = '';
             foreach ($matchingRows as $row) {
-                $pk = $pkCol !== null ? ((string) ($row[$pkCol] ?? '0')) : '0';
+                $pk = $this->rowKey($table, $row);
                 $html .= $this->buildWalEntry($row, 'delete', $txId, $pk);
             }
 
@@ -597,9 +606,9 @@ HTML;
             if (file_exists($walPath)) {
                 $walEntries = $this->parseWalEntries($walPath);
                 foreach ($walEntries as $entry) {
-                    $pk  = $entry['pk'];
+                    $pk  = (string) $entry['pk'];
                     $op  = $entry['op'];
-                    $key = ($pkCol !== null && $pk !== '0') ? $pk : count($rows);
+                    $key = ($pk !== '' && $pk !== '0') ? $pk : (string) count($rows);
 
                     if ($op === 'delete') {
                         unset($rows[$key]);
@@ -608,9 +617,19 @@ HTML;
                             // Merge: existing data + WAL update
                             $rows[$key]['data'] = array_merge($rows[$key]['data'], $entry['data']);
                             $rows[$key]['tx']   = $entry['tx'];
+                            // No-PK tables: row identity is its content hash,
+                            // re-key so later entries find the mutated row.
+                            if ($pkCol === null) {
+                                $newKey = $this->rowKey($table, $rows[$key]['data']);
+                                if ($newKey !== $key) {
+                                    $rows[$newKey] = $rows[$key];
+                                    unset($rows[$key]);
+                                }
+                            }
                         } else {
                             // Update for a row not in chunks — treat as full row
-                            $rows[$key] = ['data' => $entry['data'], 'tx' => $entry['tx']];
+                            $rows[$pkCol === null ? $this->rowKey($table, $entry['data']) : $key]
+                                = ['data' => $entry['data'], 'tx' => $entry['tx']];
                         }
                     } elseif ($op === 'insert') {
                         $rows[$key] = ['data' => $entry['data'], 'tx' => $entry['tx']];
@@ -619,6 +638,20 @@ HTML;
             }
 
             return array_values($rows);
+        }
+
+        /**
+         * Stable identity for a row. PK column when the table has one;
+         * otherwise a content hash so WAL tombstones/updates on no-PK
+         * tables (term_relationships, custom tables) hit the right row.
+         */
+        public function rowKey(string $table, array $data): string
+        {
+            $pkCol = $this->resolvePkColumn($table);
+            if ($pkCol !== null && isset($data[$pkCol]) && (string) $data[$pkCol] !== '') {
+                return (string) $data[$pkCol];
+            }
+            return md5(json_encode($data, JSON_UNESCAPED_UNICODE));
         }
 
         /**
@@ -634,6 +667,28 @@ HTML;
                 $data = $row['data'];
                 $match = true;
                 foreach ($conditions as $col => $val) {
+                    if (is_array($val) && isset($val['__in__'])) {
+                        if (!in_array((string)($data[$col] ?? ''), array_map('strval', $val['__in__']), true)) {
+                            $match = false;
+                            break;
+                        }
+                        continue;
+                    }
+                    if (is_array($val) && isset($val['__cmp__'])) {
+                        [$cv, $op] = $val['__cmp__'];
+                        $dv = $data[$col] ?? '';
+                        if (is_numeric($dv) && is_numeric($cv)) { $a = (float)$dv; $b = (float)$cv; }
+                        else { $a = (string)$dv; $b = (string)$cv; }
+                        $ok = match ($op) {
+                            '>'  => $a > $b,
+                            '>=' => $a >= $b,
+                            '<'  => $a < $b,
+                            '<=' => $a <= $b,
+                            default => false,
+                        };
+                        if (!$ok) { $match = false; break; }
+                        continue;
+                    }
                     if (!array_key_exists($col, $data) || (string) $data[$col] !== (string) $val) {
                         $match = false;
                         break;
@@ -645,6 +700,130 @@ HTML;
             }
 
             return $matched;
+        }
+
+        /**
+         * Find a single row by PK equality (chunk-routed read + WAL merge).
+         */
+        public function findRowByPk(string $table, string $pk): ?array
+        {
+            $pkCol = $this->resolvePkColumn($table);
+            if ($pkCol === null) {
+                return null;
+            }
+            $rows = $this->readRows($table, [$pkCol => $pk]);
+            foreach ($rows as $row) {
+                if ((string) ($row['data'][$pkCol] ?? '') === $pk) {
+                    return $row['data'];
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Append an update WAL entry targeting one PK directly, without
+         * scanning the whole table (used by upsert paths).
+         */
+        public function updateRowsByPk(string $table, string $pk, array $setValues, int $txId): int
+        {
+            $existing = $this->findRowByPk($table, $pk);
+            if ($existing === null) {
+                return 0;
+            }
+            $resolved = [];
+            foreach ($setValues as $col => $val) {
+                if (is_array($val) && array_key_exists('__delta__', $val)) {
+                    $sum = ((float) ($existing[$col] ?? 0)) + $val['__delta__'];
+                    $resolved[$col] = (fmod($sum, 1.0) === 0.0)
+                        ? (string) (int) $sum
+                        : (string) $sum;
+                } else {
+                    $resolved[$col] = $val;
+                }
+            }
+            $merged = array_merge($existing, $resolved);
+            $this->appendToWal($table, $this->buildWalEntry($merged, 'update', $txId, $pk));
+            $this->incrementMeta($table, 'wal_entries', 1);
+            $this->maybeCompact($table);
+            return 1;
+        }
+
+        /**
+         * Append a tombstone for one PK directly (REPLACE path).
+         */
+        public function deleteRowsByPk(string $table, string $pk, int $txId): int
+        {
+            $existing = $this->findRowByPk($table, $pk);
+            if ($existing === null) {
+                return 0;
+            }
+            $this->appendToWal($table, $this->buildWalEntry($existing, 'delete', $txId, $pk));
+            $this->incrementMeta($table, 'wal_entries', 1);
+            $this->incrementMeta($table, 'total_rows', -1);
+            $this->maybeCompact($table);
+            return 1;
+        }
+
+        /**
+         * Remove a table directory entirely.
+         */
+        public function dropTable(string $table): void
+        {
+            $dir = $this->router->tableDir($table);
+            if (!is_dir($dir)) {
+                return;
+            }
+            foreach (scandir($dir) ?: [] as $f) {
+                if ($f === '.' || $f === '..') continue;
+                @unlink($dir . '/' . $f);
+            }
+            @rmdir($dir);
+            unset($this->metaCache[$table]);
+        }
+
+        /**
+         * Empty a table but keep its directory, sequence and meta skeleton.
+         */
+        public function truncateTable(string $table): void
+        {
+            $dir = $this->router->tableDir($table);
+            if (!is_dir($dir)) {
+                return;
+            }
+            foreach (scandir($dir) ?: [] as $f) {
+                if (preg_match('/^(chunk_.*|wal.*|_index\.html|_meta\.json)$/', $f)) {
+                    @unlink($dir . '/' . $f);
+                }
+            }
+            $this->metaCache[$table] = [
+                'table'       => $table,
+                'pk'          => $this->resolvePkColumn($table),
+                'chunk_size'  => $this->config->chunkSize,
+                'chunks'      => 0,
+                'total_rows'  => 0,
+                'wal_entries' => 0,
+                'updated_at'  => gmdate('Y-m-d\TH:i:s\Z'),
+            ];
+            $metaPath = $this->router->metaPath($table);
+            $tmpMeta  = $metaPath . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
+            @file_put_contents($tmpMeta, json_encode($this->metaCache[$table], JSON_PRETTY_PRINT));
+            @rename($tmpMeta, $metaPath);
+        }
+
+        /**
+         * Column names of a table, sampled from stored rows.
+         *
+         * @return string[]
+         */
+        public function listColumns(string $table): array
+        {
+            $rows = $this->readRows($table);
+            foreach ($rows as $row) {
+                if (!empty($row['data'])) {
+                    return array_keys($row['data']);
+                }
+            }
+            return [];
         }
 
         // -- Auto-increment ---------------------------------------------------
@@ -666,13 +845,36 @@ HTML;
             $current = (int) $file->fgets();
             $next = $current + 1;
 
-            // Crash-safe: write to temp, then rename
-            $tmpPath = $seqPath . '.tmp';
-            file_put_contents($tmpPath, (string) $next, LOCK_EX);
+            // Crash-safe: write to a process-unique temp, then rename
+            $tmpPath = $seqPath . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
+            file_put_contents($tmpPath, (string) $next);
             rename($tmpPath, $seqPath);
 
             $file->flock(LOCK_UN);
             return $next;
+        }
+
+        /**
+         * Raise the per-table sequence to at least the given explicit PK so
+         * later auto-increments never collide with explicitly-inserted IDs.
+         */
+        public function advanceSequence(string $table, int $pk): void
+        {
+            $this->router->ensureTableDir($table);
+            $seqPath = $this->router->seqPath($table);
+
+            $file = new SplFileObject($seqPath, 'c+');
+            if (!$file->flock(LOCK_EX)) {
+                return;
+            }
+            $file->rewind();
+            $current = (int) $file->fgets();
+            if ($pk > $current) {
+                $tmpPath = $seqPath . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
+                file_put_contents($tmpPath, (string) $pk);
+                rename($tmpPath, $seqPath);
+            }
+            $file->flock(LOCK_UN);
         }
 
         // -- Global TX counter ------------------------------------------------
@@ -692,8 +894,8 @@ HTML;
             $current = (int) $file->fgets();
             $next = $current + 1;
 
-            $tmpPath = $seqPath . '.tmp';
-            file_put_contents($tmpPath, (string) $next, LOCK_EX);
+            $tmpPath = $seqPath . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
+            file_put_contents($tmpPath, (string) $next);
             rename($tmpPath, $seqPath);
 
             $file->flock(LOCK_UN);
@@ -719,12 +921,13 @@ HTML;
         /**
          * Fold WAL entries into chunk files.
          *
-         * Strategy:
+         * Strategy (full rebuild — simple and correct):
          * 1. Acquire exclusive compact lock
          * 2. Rename wal.html → wal.processing.html (new writes go to fresh wal.html)
-         * 3. Read all chunks + processing WAL, merge in-memory
-         * 4. Rewrite affected chunks as temp + rename (crash-safe)
-         * 5. Delete wal.processing.html
+         * 3. Read ALL chunks, apply every WAL entry in TX order
+         * 4. Re-bucket surviving rows into chunks by PK range (or
+         *    sequentially for no-PK tables), rewrite all chunks
+         * 5. Delete stale chunk files + wal.processing.html
          * 6. Update _meta.json + _index.html
          */
         public function compact(string $table): void
@@ -761,85 +964,108 @@ HTML;
 
                 $pkCol = $this->resolvePkColumn($table);
 
-                // Step 3: Group WAL entries by target chunk
-                $chunkUpdates = []; // chunkFile => [pk => entry]
-                $allInserts   = []; // for rows without clear chunk assignment
+                // Step 3: Load every existing chunk into one map
+                $rowsByKey = [];
+                foreach ($this->router->listChunks($tableDir) as $chunkFile) {
+                    foreach ($this->parseHtmlRows($tableDir . '/' . $chunkFile) as $row) {
+                        $key = $this->rowKey($table, $row['data']);
+                        $rowsByKey[$key] = $row;
+                    }
+                }
 
+                // Apply WAL entries in file (TX) order
                 foreach ($walEntries as $entry) {
-                    $pk = $entry['pk'];
-                    $pkInt = (int) $pk;
-
-                    if ($pkInt > 0 && $pkCol !== null) {
-                        $chunkFile = $this->router->chunkForPk($pkInt);
-                        $chunkUpdates[$chunkFile][$pk] = $entry;
-                    } else {
-                        $allInserts[] = $entry;
-                    }
-                }
-
-                // Pre-calculate total chunks that will exist after compaction
-                $existingChunks = $this->router->listChunks($tableDir);
-                $allChunkNames = array_unique(array_merge($existingChunks, array_keys($chunkUpdates)));
-                if (!empty($allInserts)) {
-                    $allChunkNames[] = 'chunk_0001.html';
-                    $allChunkNames = array_unique($allChunkNames);
-                }
-                sort($allChunkNames);
-                $totalChunksKnown = count($allChunkNames);
-
-                // Step 4: Update each affected chunk
-                foreach ($chunkUpdates as $chunkFile => $entries) {
-                    $chunkPath = $tableDir . '/' . $chunkFile;
-                    $existing = file_exists($chunkPath) ? $this->parseHtmlRows($chunkPath) : [];
-
-                    // Index by PK
-                    $rowsByPk = [];
-                    foreach ($existing as $row) {
-                        $key = ($pkCol !== null && isset($row['data'][$pkCol])) ? $row['data'][$pkCol] : count($rowsByPk);
-                        $rowsByPk[$key] = $row;
-                    }
-
-                    // Apply WAL entries
-                    foreach ($entries as $pk => $entry) {
-                        if ($entry['op'] === 'delete') {
-                            unset($rowsByPk[$pk]);
-                        } elseif ($entry['op'] === 'update') {
-                            if (isset($rowsByPk[$pk])) {
-                                $rowsByPk[$pk]['data'] = array_merge($rowsByPk[$pk]['data'], $entry['data']);
-                                $rowsByPk[$pk]['tx'] = $entry['tx'];
-                            } else {
-                                $rowsByPk[$pk] = ['data' => $entry['data'], 'tx' => $entry['tx']];
+                    $pk = (string) $entry['pk'];
+                    if ($entry['op'] === 'delete') {
+                        if ($pk !== '' && $pk !== '0') {
+                            unset($rowsByKey[$pk]);
+                        } else {
+                            // Hash-keyed tombstone: match by content
+                            foreach ($rowsByKey as $k => $r) {
+                                if ($this->rowKey($table, $r['data']) === $k
+                                    && $this->rowMatches($table, $r['data'], $entry['data'])) {
+                                    unset($rowsByKey[$k]);
+                                    break;
+                                }
                             }
-                        } elseif ($entry['op'] === 'insert') {
-                            $rowsByPk[$pk] = ['data' => $entry['data'], 'tx' => $entry['tx']];
                         }
+                    } elseif ($entry['op'] === 'update') {
+                        if ($pk !== '' && $pk !== '0' && isset($rowsByKey[$pk])) {
+                            $rowsByKey[$pk]['data'] = array_merge($rowsByKey[$pk]['data'], $entry['data']);
+                            $rowsByKey[$pk]['tx']   = $entry['tx'];
+                            if ($pkCol === null) {
+                                $newKey = $this->rowKey($table, $rowsByKey[$pk]['data']);
+                                if ($newKey !== $pk) {
+                                    $rowsByKey[$newKey] = $rowsByKey[$pk];
+                                    unset($rowsByKey[$pk]);
+                                }
+                            }
+                        } else {
+                            $rowsByKey[$pk !== '' && $pk !== '0' ? $pk : $this->rowKey($table, $entry['data'])]
+                                = ['data' => $entry['data'], 'tx' => $entry['tx']];
+                        }
+                    } else { // insert
+                        $rowsByKey[$pk !== '' && $pk !== '0' ? $pk : $this->rowKey($table, $entry['data'])]
+                            = ['data' => $entry['data'], 'tx' => $entry['tx']];
                     }
-
-                    // Write chunk (crash-safe: temp + rename)
-                    $this->writeChunkFile($table, $chunkFile, array_values($rowsByPk), $totalChunksKnown);
                 }
 
-                // Step 5: Handle inserts without PK into appropriate chunks
-                foreach ($allInserts as $entry) {
-                    if ($entry['op'] === 'insert') {
-                        // Put into chunk_0001 as fallback
-                        $chunkFile = 'chunk_0001.html';
-                        $chunkPath = $tableDir . '/' . $chunkFile;
-                        $existing = file_exists($chunkPath) ? $this->parseHtmlRows($chunkPath) : [];
-                        $existing[] = ['data' => $entry['data'], 'tx' => $entry['tx']];
-                        $this->writeChunkFile($table, $chunkFile, $existing, $totalChunksKnown);
+                // Step 4: Re-bucket rows into chunks
+                $buckets = []; // chunkNum => rows[]
+                $seq = 0;
+                foreach ($rowsByKey as $row) {
+                    if ($pkCol !== null && isset($row['data'][$pkCol]) && (int) $row['data'][$pkCol] > 0) {
+                        $num = (int) ceil(((int) $row['data'][$pkCol]) / $this->config->chunkSize);
+                        if ($num < 1) $num = 1;
+                    } else {
+                        $num = (int) floor($seq / $this->config->chunkSize) + 1;
+                    }
+                    $buckets[$num][] = $row;
+                    $seq++;
+                }
+                ksort($buckets);
+                $totalChunks = max(1, count($buckets));
+
+                // Rewrite all chunks; remove stale ones
+                $keepFiles = [];
+                foreach ($buckets as $num => $rows) {
+                    $chunkFile = sprintf('chunk_%04d.html', $num);
+                    $keepFiles[] = $chunkFile;
+                    $this->writeChunkFile($table, $chunkFile, $rows, $totalChunks);
+                }
+                foreach ($this->router->listChunks($tableDir) as $old) {
+                    if (!in_array($old, $keepFiles, true)) {
+                        @unlink($tableDir . '/' . $old);
                     }
                 }
+                if (empty($buckets)) {
+                    // Table emptied — write a single empty chunk so pages exist
+                    $this->writeChunkFile($table, 'chunk_0001.html', [], 1);
+                }
 
-                // Step 6: Cleanup
+                // Step 5: Cleanup
                 @unlink($processingPath);
 
-                // Step 7: Update metadata
+                // Step 6: Update metadata
                 $this->rebuildMetaAndIndex($table);
 
             } finally {
                 $lockFile->flock(LOCK_UN);
             }
+        }
+
+        /**
+         * Loose content match used for hash-keyed tombstones: every column
+         * present in the candidate must be equal.
+         */
+        private function rowMatches(string $table, array $row, array $candidate): bool
+        {
+            foreach ($candidate as $col => $val) {
+                if ((string) ($row[$col] ?? '') !== (string) $val) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         // -- SHOW TABLES support ----------------------------------------------
@@ -1058,15 +1284,11 @@ HTML;
         }
 
         /**
-         * Extract PK value from a payload row.
+         * Extract PK value from a payload row (PK column or content hash).
          */
         private function extractPkFromPayload(string $table, array $payload): string
         {
-            $pkCol = $this->resolvePkColumn($table);
-            if ($pkCol !== null && isset($payload[$pkCol])) {
-                return (string) $payload[$pkCol];
-            }
-            return '0';
+            return $this->rowKey($table, $payload);
         }
 
         /**
@@ -1099,11 +1321,11 @@ HTML;
         /**
          * Write a chunk file with styled HTML page (crash-safe: temp + rename).
          */
-        private function writeChunkFile(string $table, string $chunkFile, array $rows, ?int $knownTotalChunks = null): void
+        private function writeChunkFile(string $table, string $chunkFile, array $rows, ?int $knownTotalChunks = null, ?int $knownTotalRows = null): void
         {
             $tableDir = $this->router->tableDir($table);
             $targetPath = $tableDir . '/' . $chunkFile;
-            $tmpPath    = $targetPath . '.tmp';
+            $tmpPath    = $targetPath . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
 
             // Build tbody HTML
             $tbodyHtml = '';
@@ -1132,8 +1354,9 @@ HTML;
                 $totalChunks = count($allChunks);
             }
 
-            // Count approximate total rows
-            $totalRows = count($rows) * $totalChunks; // rough estimate
+            // Exact total when provided by the caller (compaction knows),
+            // otherwise fall back to a per-chunk estimate.
+            $totalRows = $knownTotalRows ?? count($rows) * $totalChunks;
 
             $html = $this->pageBuilder->buildChunkPage(
                 $table,
@@ -1160,22 +1383,19 @@ HTML;
             $chunks   = $this->router->listChunks($tableDir);
             $totalChunks = count($chunks);
 
-            // Count total rows and re-stamp chunk navigation
+            // Single parse pass: count rows per chunk and overall
             $totalRows = 0;
-            $chunkRowCounts = [];
+            $chunkRows = [];
             foreach ($chunks as $chunkFile) {
                 $rows = $this->parseHtmlRows($tableDir . '/' . $chunkFile);
                 $totalRows += count($rows);
-                $chunkRowCounts[$chunkFile] = count($rows);
+                $chunkRows[$chunkFile] = $rows;
             }
 
-            // Re-stamp all chunk files with correct navigation links
+            // Re-stamp chunk navigation with exact totals (chunk files were
+            // just rewritten by compaction; this refreshes page counts).
             foreach ($chunks as $chunkFile) {
-                $chunkPath = $tableDir . '/' . $chunkFile;
-                $rows = $this->parseHtmlRows($chunkPath);
-                if (!empty($rows)) {
-                    $this->writeChunkFile($table, $chunkFile, $rows, $totalChunks);
-                }
+                $this->writeChunkFile($table, $chunkFile, $chunkRows[$chunkFile], $totalChunks, $totalRows);
             }
 
             // Count WAL entries
@@ -1197,7 +1417,7 @@ HTML;
                 'updated_at'  => gmdate('Y-m-d\TH:i:s\Z'),
             ];
             $metaPath = $this->router->metaPath($table);
-            $tmpMeta  = $metaPath . '.tmp';
+            $tmpMeta  = $metaPath . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
             file_put_contents($tmpMeta, json_encode($meta, JSON_PRETTY_PRINT));
             rename($tmpMeta, $metaPath);
 
@@ -1206,7 +1426,7 @@ HTML;
             // Write _index.html
             $indexHtml = $this->pageBuilder->buildIndexPage($table, $chunks, $totalRows, $walEntries);
             $indexPath = $tableDir . '/_index.html';
-            $tmpIndex  = $indexPath . '.tmp';
+            $tmpIndex  = $indexPath . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
             file_put_contents($tmpIndex, $indexHtml);
             rename($tmpIndex, $indexPath);
 
@@ -1257,18 +1477,39 @@ HTML;
 
         /**
          * Increment a numeric field in _meta.json.
+         * Read-modify-write under an exclusive meta lock so concurrent
+         * writers cannot lose updates.
          */
         private function incrementMeta(string $table, string $field, int $delta): void
         {
-            $meta = $this->readMeta($table);
-            $meta[$field] = ($meta[$field] ?? 0) + $delta;
-            $meta['updated_at'] = gmdate('Y-m-d\TH:i:s\Z');
-            $this->metaCache[$table] = $meta;
-
             $metaPath = $this->router->metaPath($table);
-            $tmpMeta  = $metaPath . '.tmp';
+            $lockPath = $this->router->tableDir($table) . '/.meta.lock';
+
+            $lf = @fopen($lockPath, 'c');
+            if ($lf) {
+                flock($lf, LOCK_EX);
+            }
+
+            // Re-read from disk (not the request cache) for the RMW cycle
+            $meta = [];
+            if (file_exists($metaPath)) {
+                $decoded = json_decode((string) @file_get_contents($metaPath), true);
+                if (is_array($decoded)) {
+                    $meta = $decoded;
+                }
+            }
+            $meta[$field]    = ($meta[$field] ?? 0) + $delta;
+            $meta['updated_at'] = gmdate('Y-m-d\TH:i:s\Z');
+
+            $tmpMeta = $metaPath . '.tmp.' . getmypid() . '.' . bin2hex(random_bytes(4));
             @file_put_contents($tmpMeta, json_encode($meta, JSON_PRETTY_PRINT));
             @rename($tmpMeta, $metaPath);
+            $this->metaCache[$table] = $meta;
+
+            if ($lf) {
+                flock($lf, LOCK_UN);
+                fclose($lf);
+            }
         }
 
         /**
@@ -1304,8 +1545,10 @@ HTML;
                 $footer = $this->pageBuilder->buildWalFooter();
                 fwrite($fh, $header . $trContent . $footer);
             } else {
-                // Existing WAL — find </tbody> and insert before it
-                $tailLen = min($size, 256);
+                // Existing WAL — find </tbody> and insert before it.
+                // Window must comfortably exceed the footer size or the marker
+                // gets lost and the file degrades to raw-append mode.
+                $tailLen = min($size, 4096);
                 fseek($fh, -$tailLen, SEEK_END);
                 $tail = fread($fh, $tailLen);
 
@@ -1342,17 +1585,26 @@ HTML;
                 mkdir($dir, 0755, true);
             }
 
-            // Security: .htaccess
+            // Security: .htaccess — serve the browsable pages, deny raw internals.
+            // NOTE: Apache-only. On nginx the whole directory is web-exposed by
+            // design of this experiment; deny it there via location block if needed.
             $htaccessPath = $dir . '/.htaccess';
             if (!file_exists($htaccessPath)) {
                 file_put_contents($htaccessPath, implode("\n", [
-                    '# HtmlDB — Deny all direct access to database files',
+                    '# HtmlDB — browsable pages yes, raw internals no',
                     '<IfModule mod_authz_core.c>',
-                    '    Require all denied',
+                    '    <FilesMatch "(^\\.|\\.tmp$|\\.lock$|^_meta\\.json$)">',
+                    '        Require all denied',
+                    '    </FilesMatch>',
+                    '    Require all granted',
                     '</IfModule>',
                     '<IfModule !mod_authz_core.c>',
-                    '    Order deny,allow',
-                    '    Deny from all',
+                    '    <FilesMatch "(^\\.|\\.tmp$|\\.lock$|^_meta\\.json$)">',
+                    '        Order allow,deny',
+                    '        Deny from all',
+                    '    </FilesMatch>',
+                    '    Order allow,deny',
+                    '    Allow from all',
                     '</IfModule>',
                     '',
                 ]));
@@ -1388,7 +1640,6 @@ HTML;
         {
             $css = <<<'CSS'
 /* HtmlDB v3.0 — Retro Terminal Theme */
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
 
 :root {
   --bg: #0a0a0a;
@@ -1621,7 +1872,8 @@ namespace HtmlDatabase\Parser {
             // 1. Strip trailing semicolons
             $sql = rtrim($sql, "; \t\n\r");
 
-            // 2. Strip ON DUPLICATE KEY UPDATE (state-machine aware)
+            // 2. Capture ON DUPLICATE KEY UPDATE clause (state-machine aware)
+            $onDup = $this->extractOnDuplicate($sql);
             $sql = $this->stripOnDuplicate($sql);
 
             // 3. Extract table name
@@ -1669,7 +1921,7 @@ namespace HtmlDatabase\Parser {
                 return null;
             }
 
-            return ['table' => $table, 'columns' => $columns, 'rows' => $rows];
+            return ['table' => $table, 'columns' => $columns, 'rows' => $rows, 'onDuplicate' => $onDup];
         }
 
         private function extractParenGroup(string $sql, int $startPos): ?array
@@ -1736,7 +1988,69 @@ namespace HtmlDatabase\Parser {
         {
             $v = trim($v);
             if (strcasecmp($v, 'NULL') === 0) return '';
+            if (preg_match('/^(NOW|CURRENT_TIMESTAMP|CURRENT_DATE|CURDATE)\(*$/i', $v)) {
+                return gmdate('Y-m-d H:i:s');
+            }
+            if (preg_match('/^UNIX_TIMESTAMP\(\)$/i', $v)) {
+                return (string) time();
+            }
             return stripslashes($v);
+        }
+
+        /**
+         * Return the raw "col = val, ..." part of an ON DUPLICATE KEY UPDATE
+         * clause (without the keyword), or null when absent.
+         */
+        private function extractOnDuplicate(string $sql): ?array
+        {
+            $upper = strtoupper($sql);
+            $inStr = false;
+            $esc   = false;
+            $len   = strlen($sql);
+
+            for ($i = 0; $i < $len; $i++) {
+                $ch = $sql[$i];
+                if ($esc) { $esc = false; continue; }
+                if ($ch === '\\') { $esc = true; continue; }
+                if ($ch === "'") {
+                    if ($inStr && isset($sql[$i + 1]) && $sql[$i + 1] === "'") { $i++; continue; }
+                    $inStr = !$inStr;
+                    continue;
+                }
+                if ($inStr) continue;
+                if ($upper[$i] === 'O' && substr($upper, $i, 22) === 'ON DUPLICATE KEY UPDATE') {
+                    $clause = trim(substr($sql, $i + 21));
+                    if ($clause === '') return null;
+                    $pairs = [];
+                    foreach ($this->splitAssignments($clause) as $assign) {
+                        if (preg_match('/^([a-zA-Z0-9_]+)\s*=\s*(.*)$/s', trim($assign), $m)) {
+                            $pairs[$m[1]] = trim($m[2]);
+                        }
+                    }
+                    return $pairs ?: null;
+                }
+            }
+            return null;
+        }
+
+        /** Split "a = 'x', b = 2" on top-level commas. */
+        private function splitAssignments(string $clause): array
+        {
+            $out = [];
+            $buf = '';
+            $inStr = false;
+            $esc = false;
+            $len = strlen($clause);
+            for ($i = 0; $i < $len; $i++) {
+                $ch = $clause[$i];
+                if ($esc) { $buf .= $ch; $esc = false; continue; }
+                if ($ch === '\\') { $esc = true; $buf .= $ch; continue; }
+                if ($ch === "'") { $inStr = !$inStr; $buf .= $ch; continue; }
+                if ($ch === ',' && !$inStr) { $out[] = $buf; $buf = ''; continue; }
+                $buf .= $ch;
+            }
+            if (trim($buf) !== '') $out[] = $buf;
+            return $out;
         }
 
         private function stripOnDuplicate(string $sql): string
@@ -1813,20 +2127,166 @@ namespace HtmlDatabase\Parser {
             $calcFoundRows = (bool) preg_match('/\bSQL_CALC_FOUND_ROWS\b/i', $sql);
             $sql = preg_replace('/\bSQL_CALC_FOUND_ROWS\b/i', '', $sql);
 
-            // Table name
-            if (!preg_match('/FROM\s+([a-zA-Z0-9_]+)/i', $sql, $tblMatch)) {
+            // FROM table + optional alias
+            if (!preg_match('/FROM\s+([a-zA-Z0-9_]+)(?:\s+(?:AS\s+)?([a-zA-Z0-9_]+))?/i', $sql, $tblMatch)) {
                 return null;
             }
-            $table = $tblMatch[1];
+            $table     = $tblMatch[1];
+            $mainAlias = $tblMatch[2] ?? '';
+            $sqlKw = ['WHERE', 'ORDER', 'GROUP', 'LIMIT', 'INNER', 'LEFT', 'RIGHT',
+                      'CROSS', 'JOIN', 'ON', 'SET', 'VALUES', 'UNION', 'HAVING', 'FOR'];
+            if ($mainAlias !== '' && in_array(strtoupper($mainAlias), $sqlKw, true)) {
+                $mainAlias = '';
+            }
+            if ($mainAlias === '') {
+                $mainAlias = $table;
+            }
+
+            // JOIN specs: alias => join graph edge toward its parent alias
+            $joins = [];
+            if (preg_match_all(
+                '/(LEFT|RIGHT|INNER|CROSS)?\s*JOIN\s+([a-zA-Z0-9_]+)(?:\s+(?:AS\s+)?([a-zA-Z0-9_]+))?\s+ON\s*\(?\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*=\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*\)?/i',
+                $sql, $jm, PREG_SET_ORDER)) {
+                foreach ($jm as $j) {
+                    $joinType = strtoupper($j[1] ?? '');
+                    $jTable   = $j[2];
+                    $jAlias   = ($j[3] ?? '') !== '' ? $j[3] : $j[2];
+                    if ($j[4] === $jAlias) {
+                        $parent = $j[6]; $parentCol = $j[7]; $thisCol = $j[5];
+                    } elseif ($j[6] === $jAlias) {
+                        $parent = $j[4]; $parentCol = $j[5]; $thisCol = $j[7];
+                    } else {
+                        continue;
+                    }
+                    $joins[$jAlias] = [
+                        'table'     => $jTable,
+                        'parent'    => $parent,
+                        'parentCol' => $parentCol,
+                        'thisCol'   => $thisCol,
+                        'left'      => $joinType === 'LEFT' || $joinType === 'RIGHT',
+                    ];
+                }
+            }
+
+            // Raw WHERE — extracted BEFORE prefix stripping so that
+            // alias-qualified conditions can be attributed to joined tables.
+            $rawWhere = null;
+            if (preg_match('/WHERE\s+(.*?)(?:\s+ORDER\s+BY|\s+GROUP\s+BY|\s+LIMIT|\s+HAVING|$)/is', $sql, $wm)) {
+                $rawWhere = trim($wm[1]);
+            }
+
+            // Route alias-qualified conditions on joined tables into joinFilters
+            $joinFilters = [];
+            if ($rawWhere !== null && !empty($joins)) {
+                $kept = [];
+                foreach ($this->splitOnTopLevelAnd($rawWhere) as $part) {
+                    $p = $this->stripOuterParens(trim($part));
+
+                    // OR group over the same joined column → IN filter
+                    if (preg_match('/\bOR\b/i', $p)) {
+                        $ops  = preg_split('/\s+OR\s+/i', $p);
+                        $a = $c = null; $vals = []; $ok = true;
+                        foreach ($ops as $op) {
+                            $op = $this->stripOuterParens(trim($op));
+                            if (preg_match('/^([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*=\s*[\'"](.*?)[\'"]$/s', $op, $om)
+                                && isset($joins[$om[1]])) {
+                                if ($a === null) { $a = $om[1]; $c = $om[2]; }
+                                elseif ($a !== $om[1] || $c !== $om[2]) { $ok = false; break; }
+                                $vals[] = $om[3];
+                            } else { $ok = false; break; }
+                        }
+                        if ($ok && $a !== null) {
+                            $joinFilters[] = ['alias' => $a, 'col' => $c, 'op' => 'in', 'vals' => $vals];
+                            continue;
+                        }
+                    }
+
+                    if (preg_match('/^([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\s*(.*)$/s', $p, $am)
+                        && isset($joins[$am[1]])) {
+                        $jf = $this->parseJoinFilter($am[1], $am[2], trim($am[3]));
+                        if ($jf !== null) { $joinFilters[] = $jf; continue; }
+                    }
+                    $kept[] = $part;
+                }
+                $rawWhere = empty($kept) ? null : implode(' AND ', $kept);
+            }
+
+            // Raw SELECT list — captured BEFORE prefix stripping so that
+            // alias-qualified columns (t.*, tt.count) can drive join fan-out.
+            preg_match('/SELECT\s+(DISTINCT\s+)?(.*?)\s+FROM/is', $sql, $colMatch);
+            $distinct = !empty($colMatch[1]);
+            $rawSelect = trim($colMatch[2] ?? '*');
+
+            $selectQualified = []; // [alias, col|'*'] pairs referencing joins
+            if (preg_match_all('/\b([a-zA-Z0-9_]+)\.(\*|[a-zA-Z0-9_]+)/', $rawSelect, $qcm, PREG_SET_ORDER)) {
+                foreach ($qcm as $qc) {
+                    if (isset($joins[$qc[1]])) {
+                        $selectQualified[] = ['alias' => $qc[1], 'col' => $qc[2]];
+                    }
+                }
+            }
 
             // Strip table/alias prefixes: wp_posts.* → *, wp_posts.ID → ID
             $sql = preg_replace('/\b[a-zA-Z0-9_]+\.\*/', '*', $sql);
             $sql = preg_replace('/\b[a-zA-Z0-9_]+\.([a-zA-Z0-9_]+)/', '$1', $sql);
+            if ($rawWhere !== null) {
+                $rawWhere = preg_replace('/\b[a-zA-Z0-9_]+\.\*/', '*', $rawWhere);
+                $rawWhere = preg_replace('/\b[a-zA-Z0-9_]+\.([a-zA-Z0-9_]+)/', '$1', $rawWhere);
+            }
 
-            // Columns
-            preg_match('/SELECT\s+(.*?)\s+FROM/is', $sql, $colMatch);
-            $rawCols = $colMatch[1] ?? '*';
-            $columns = array_map('trim', explode(',', $rawCols));
+            // Columns: normalize "expr AS alias" to the alias, drop function
+            // expressions (aggregates are computed separately). Capture the
+            // select list with a match — a preg_replace here would delete the
+            // FROM keyword and glue the rest of the query onto the last column.
+            $rawCols = preg_match('/SELECT\s+(?:DISTINCT\s+)?(.*?)\s+FROM/is', $sql, $rcm)
+                ? $rcm[1] : '*';
+            $columns = [];
+            foreach (array_map('trim', explode(',', $rawCols)) as $c) {
+                if ($c === '') continue;
+                if (preg_match('/\bAS\s+([a-zA-Z0-9_]+)$/i', $c, $am)) {
+                    $columns[] = $am[1];
+                } elseif (preg_match('/^[a-zA-Z0-9_*]+$/', $c)) {
+                    $columns[] = $c;
+                }
+            }
+            if (empty($columns)) $columns = ['*'];
+
+            // Aggregates (per-group when GROUP BY is present, else global)
+            $aggregates = [];
+            if (preg_match_all(
+                '/\b(COUNT|MAX|MIN|SUM|AVG)\s*\(\s*(DISTINCT\s+)?(\*|[a-zA-Z0-9_]+)\s*\)(?:\s+AS\s+([a-zA-Z0-9_]+))?/i',
+                $rawCols, $agm, PREG_SET_ORDER)) {
+                foreach ($agm as $ag) {
+                    $aggregates[] = [
+                        'fn'       => strtoupper($ag[1]),
+                        'distinct' => !empty($ag[2]),
+                        'col'      => $ag[3],
+                        'alias'    => ($ag[4] ?? '') !== '' ? $ag[4] : trim($ag[0]),
+                    ];
+                }
+            }
+
+            // GROUP BY
+            $groupBy = [];
+            if (preg_match('/GROUP\s+BY\s+(.*?)(?:\s+HAVING|\s+ORDER\s+BY|\s+LIMIT|$)/is', $sql, $gm)) {
+                foreach (explode(',', $gm[1]) as $g) {
+                    $g = trim($g);
+                    if (preg_match('/^[a-zA-Z0-9_]+$/', $g)) {
+                        $groupBy[] = $g;
+                    }
+                }
+            }
+
+            // HAVING (simple col op value against aggregate aliases)
+            $having = [];
+            if (preg_match('/HAVING\s+(.*?)(?:\s+ORDER\s+BY|\s+LIMIT|$)/is', $sql, $hm)) {
+                foreach ($this->splitOnTopLevelAnd($hm[1]) as $hp) {
+                    $hp = trim($hp);
+                    if (preg_match('/^([a-zA-Z0-9_]+)\s*(>=|<=|!=|<>|>|<|=)\s*(-?\d+(?:\.\d+)?|\'[^\']*\'|"[^"]*")$/s', $hp, $hcm)) {
+                        $having[] = ['col' => $hcm[1], 'op' => $hcm[2], 'val' => trim($hcm[3], "'\"")];
+                    }
+                }
+            }
 
             // LIMIT
             $limit  = null;
@@ -1834,22 +2294,22 @@ namespace HtmlDatabase\Parser {
             if (preg_match('/LIMIT\s+(\d+)\s*,\s*(\d+)/i', $sql, $limMatch)) {
                 $offset = (int) $limMatch[1];
                 $limit  = (int) $limMatch[2];
+            } elseif (preg_match('/LIMIT\s+(\d+)\s+OFFSET\s+(\d+)/i', $sql, $limMatch)) {
+                $limit  = (int) $limMatch[1];
+                $offset = (int) $limMatch[2];
             } elseif (preg_match('/LIMIT\s+(\d+)/i', $sql, $limMatch)) {
                 $limit = (int) $limMatch[1];
             }
 
-            // ORDER BY
-            $orderBy  = null;
-            $orderDir = 'ASC';
-            if (preg_match('/ORDER\s+BY\s+([a-zA-Z0-9_]+)(?:\s+(ASC|DESC))?/i', $sql, $ordMatch)) {
-                $orderBy  = $ordMatch[1];
-                $orderDir = strtoupper($ordMatch[2] ?? 'ASC');
-            }
-
-            // Raw WHERE
-            $rawWhere = null;
-            if (preg_match('/WHERE\s+(.*?)(?:\s+ORDER\s+BY|\s+GROUP\s+BY|\s+LIMIT|$)/is', $sql, $wm)) {
-                $rawWhere = trim($wm[1]);
+            // ORDER BY (multi-column)
+            $orderBy = [];
+            if (preg_match('/ORDER\s+BY\s+(.*?)(?:\s+LIMIT|$)/is', $sql, $ordMatch)) {
+                foreach (explode(',', $ordMatch[1]) as $term) {
+                    $term = trim($term);
+                    if (preg_match('/^([a-zA-Z0-9_]+)(?:\s+(ASC|DESC))?$/i', $term, $tm)) {
+                        $orderBy[] = ['col' => $tm[1], 'dir' => strtoupper($tm[2] ?? 'ASC')];
+                    }
+                }
             }
 
             // Parse conditions
@@ -1862,6 +2322,7 @@ namespace HtmlDatabase\Parser {
             $notLikeConditions = [];
             $nullConditions   = [];
             $notNullConditions = [];
+            $orGroups         = []; // list of disjunctions: [ [cond, cond...], ... ]
 
             if ($rawWhere !== null) {
                 // Parenthesis-aware AND splitter: only split on AND at depth 0
@@ -1886,8 +2347,12 @@ namespace HtmlDatabase\Parser {
                                 'notInConditions' => [], 'comparisons' => [],
                                 'likeConditions' => [], 'notLikeConditions' => [],
                                 'nullConditions' => [], 'notNullConditions' => [],
+                                'orGroups' => [], 'joins' => [], 'joinFilters' => [],
+                                'aggregates' => [], 'distinct' => false,
+                                'mainAlias' => $mainAlias, 'selectQualified' => [],
+                                'groupBy' => [], 'having' => [],
                                 'limit' => 0, 'offset' => 0,
-                                'orderBy' => null, 'orderDir' => 'ASC',
+                                'orderBy' => [],
                                 'rawWhere' => $rawWhere,
                                 'calcFoundRows' => $calcFoundRows,
                             ];
@@ -1895,30 +2360,39 @@ namespace HtmlDatabase\Parser {
                         continue;
                     }
 
-                    // OR group → IN (handles both "(a OR b)" and bare "a OR b")
+                    // OR group → IN when same column; generic OR list otherwise.
+                    // Never silently drop: a dropped OR over-matches rows.
                     if (preg_match('/\bOR\b/i', $part)) {
-                        $inner = $part;
-                        // Strip optional outer parens
-                        if (preg_match('/^\((.+)\)$/s', $inner, $paren)) {
-                            $inner = $paren[1];
-                        }
+                        $inner = $this->stripOuterParens($part);
                         $orParts = preg_split('/\s+OR\s+/i', $inner);
                         $orCol = null;
                         $orVals = [];
+                        $orConds = [];
                         $valid = true;
                         foreach ($orParts as $op) {
                             $op = trim($op);
-                            // Strip any individual parens: (col = 'val') → col = 'val'
                             while (preg_match('/^\((.+)\)$/s', $op, $pm)) { $op = trim($pm[1]); }
                             if (preg_match('/^([a-zA-Z0-9_]+)\s*=\s*[\'"](.*?)[\'"]$/s', $op, $om)) {
                                 if ($orCol === null) $orCol = $om[1];
-                                if ($om[1] === $orCol) $orVals[] = $om[2];
-                                else { $valid = false; break; }
+                                if ($om[1] === $orCol) { $orVals[] = $om[2]; $orConds[] = ['eq', $om[1], $om[2]]; }
+                                else { $orConds[] = ['eq', $om[1], $om[2]]; $valid = false; }
+                            } elseif (preg_match('/^([a-zA-Z0-9_]+)\s*=\s*(-?\d+(?:\.\d+)?)$/s', $op, $om)) {
+                                if ($orCol === null) $orCol = $om[1];
+                                if ($om[1] === $orCol) { $orVals[] = $om[2]; $orConds[] = ['eq', $om[1], $om[2]]; }
+                                else { $orConds[] = ['eq', $om[1], $om[2]]; $valid = false; }
+                            } elseif (preg_match('/^([a-zA-Z0-9_]+)\s*(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?|\'[^\']*\'|"[^"]*")$/s', $op, $om)) {
+                                $orConds[] = ['cmp', $om[1], $om[2], trim($om[3], "'\"")];
+                                $valid = false;
                             } else { $valid = false; break; }
                         }
                         if ($valid && $orCol !== null && !empty($orVals)) {
                             $inConditions[$orCol] = $orVals;
+                        } elseif (!empty($orConds)) {
+                            // Mixed-column OR: keep as disjunction, evaluated at filter time
+                            $orGroups[] = $orConds;
                         }
+                        // If nothing could be parsed, fall through to no-op:
+                        // an unparseable OR must NOT vanish silently.
                         continue;
                     }
 
@@ -2014,31 +2488,99 @@ namespace HtmlDatabase\Parser {
                 'notLikeConditions' => $notLikeConditions,
                 'nullConditions'    => $nullConditions,
                 'notNullConditions' => $notNullConditions,
+                'orGroups'          => $orGroups,
+                'joins'             => $joins,
+                'joinFilters'       => $joinFilters,
+                'mainAlias'         => $mainAlias,
+                'selectQualified'   => $selectQualified,
+                'groupBy'           => $groupBy,
+                'having'            => $having,
+                'aggregates'        => $aggregates,
+                'distinct'          => $distinct,
                 'limit'             => $limit,
                 'offset'            => $offset,
                 'orderBy'           => $orderBy,
-                'orderDir'          => $orderDir,
                 'rawWhere'          => $rawWhere,
                 'calcFoundRows'     => $calcFoundRows,
             ];
         }
 
         /**
-         * Parse values from an IN(...) clause, handling both quoted strings and unquoted numbers.
-         * e.g. "'a','b','c'" → ['a','b','c'], "1,2,3" → ['1','2','3'], "'a',1,'b'" → ['a','1','b']
+         * Parse the operator part of an alias-qualified condition,
+         * e.g. "IN ('a','b')", "= 'x'", "LIKE '%y%'", "!= 3".
+         */
+        private function parseJoinFilter(string $alias, string $col, string $rest): ?array
+        {
+            if (preg_match('/^NOT\s+IN\s*\((.+)\)$/is', $rest, $m)) {
+                return ['alias' => $alias, 'col' => $col, 'op' => 'not_in', 'vals' => $this->parseInValues($m[1])];
+            }
+            if (preg_match('/^IN\s*\((.+)\)$/is', $rest, $m)) {
+                return ['alias' => $alias, 'col' => $col, 'op' => 'in', 'vals' => $this->parseInValues($m[1])];
+            }
+            if (preg_match('/^NOT\s+LIKE\s+[\'"](.*?)[\'"]$/is', $rest, $m)) {
+                return ['alias' => $alias, 'col' => $col, 'op' => 'not_like', 'vals' => [$m[1]]];
+            }
+            if (preg_match('/^LIKE\s+[\'"](.*?)[\'"]$/is', $rest, $m)) {
+                return ['alias' => $alias, 'col' => $col, 'op' => 'like', 'vals' => [$m[1]]];
+            }
+            if (preg_match('/^(?:!=|<>)\s*[\'"](.*?)[\'"]$/s', $rest, $m)) {
+                return ['alias' => $alias, 'col' => $col, 'op' => 'ne', 'vals' => [$m[1]]];
+            }
+            if (preg_match('/^(?:!=|<>)\s*(-?\d+(?:\.\d+)?)$/s', $rest, $m)) {
+                return ['alias' => $alias, 'col' => $col, 'op' => 'ne', 'vals' => [$m[1]]];
+            }
+            if (preg_match('/^=\s*[\'"](.*?)[\'"]$/s', $rest, $m)) {
+                return ['alias' => $alias, 'col' => $col, 'op' => 'eq', 'vals' => [$m[1]]];
+            }
+            if (preg_match('/^=\s*(-?\d+(?:\.\d+)?)$/s', $rest, $m)) {
+                return ['alias' => $alias, 'col' => $col, 'op' => 'eq', 'vals' => [$m[1]]];
+            }
+            if (preg_match('/^(>=|<=|>|<)\s*[\'"](.*?)[\'"]$/s', $rest, $m)) {
+                return ['alias' => $alias, 'col' => $col, 'op' => $m[1], 'vals' => [$m[2]]];
+            }
+            if (preg_match('/^(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)$/s', $rest, $m)) {
+                return ['alias' => $alias, 'col' => $col, 'op' => $m[1], 'vals' => [$m[2]]];
+            }
+            return null;
+        }
+
+        /**
+         * Parse values from an IN(...) clause with a proper tokenizer:
+         * quoted strings (incl. commas/escapes inside) and bare numbers,
+         * preserving order.
          */
         private function parseInValues(string $raw): array
         {
-            $vals = [];
-            // Match quoted strings
-            if (preg_match_all('/[\'"]([^\'"]*)[\'"]/', $raw, $quoted)) {
-                $vals = $quoted[1];
+            $vals  = [];
+            $buf   = '';
+            $inStr = false;
+            $quote = '';
+            $len   = strlen($raw);
+
+            for ($i = 0; $i < $len; $i++) {
+                $ch = $raw[$i];
+                if ($inStr) {
+                    if ($ch === '\\' && $i + 1 < $len) { $buf .= $raw[++$i]; continue; }
+                    if ($ch === $quote) {
+                        if (($raw[$i + 1] ?? '') === $quote) { $buf .= $quote; $i++; continue; }
+                        $inStr = false;
+                        continue;
+                    }
+                    $buf .= $ch;
+                    continue;
+                }
+                if ($ch === "'" || $ch === '"') { $inStr = true; $quote = $ch; continue; }
+                if ($ch === ',') {
+                    $t = trim($buf);
+                    if ($t !== '') $vals[] = $t;
+                    $buf = '';
+                    continue;
+                }
+                $buf .= $ch;
             }
-            // Also match unquoted numbers (not inside quotes)
-            $stripped = preg_replace('/[\'"][^\'"]*[\'"]/', '', $raw);
-            if (preg_match_all('/(-?\d+(?:\.\d+)?)/', $stripped, $nums)) {
-                $vals = array_merge($vals, $nums[1]);
-            }
+            $t = trim($buf);
+            if ($t !== '') $vals[] = $t;
+
             return $vals;
         }
 
@@ -2162,13 +2704,53 @@ namespace HtmlDatabase\Parser {
                 ? $this->storage->readRows($table, $parsed['conditions'], $parsed['inConditions'], $pkCol)
                 : [];
 
+            // Pre-build join indexes: alias => [join-key value => joined rows]
+            $joinIndex = [];
+            $mainAlias = $parsed['mainAlias'] ?? $table;
+            if (!empty($parsed['joins']) && $this->storage) {
+                foreach ($parsed['joins'] as $alias => $spec) {
+                    $rows = $this->storage->readRows($spec['table']);
+                    $idx  = [];
+                    foreach ($rows as $r) {
+                        $idx[(string)($r['data'][$spec['thisCol']] ?? '')][] = $r['data'];
+                    }
+                    $joinIndex[$alias] = ['idx' => $idx, 'spec' => $spec];
+                }
+            }
+
+            // Fan-out over the join graph: SQL semantics produce one output
+            // row per matching joined row. Filters on joined columns are
+            // applied to candidate rows during expansion, not as EXISTS.
+            $partials = [];
+            foreach ($allRows as $row) { $partials[] = $row['data']; }
+            foreach ($parsed['joins'] as $alias => $spec) {
+                $next = [];
+                foreach ($partials as $prow) {
+                    $key   = (string)($prow[$spec['parentCol']] ?? '');
+                    $cands = $joinIndex[$alias]['idx'][$key] ?? [];
+                    $matched = [];
+                    foreach ($cands as $c) {
+                        $ok = true;
+                        foreach ($parsed['joinFilters'] as $jf) {
+                            if ($jf['alias'] === $alias && !$this->joinFilterMatch($c, $jf)) { $ok = false; break; }
+                        }
+                        if ($ok) $matched[] = $c;
+                    }
+                    if (empty($matched)) {
+                        if ($spec['left']) { $next[] = $prow; }
+                        continue;
+                    }
+                    foreach ($matched as $m) { $next[] = array_merge($prow, $m); }
+                }
+                $partials = $next;
+            }
+
             // Apply conditions filter
             $filtered = [];
-            foreach ($allRows as $row) {
-                $data = $row['data'];
+            foreach ($partials as $data) {
+                $match = true;
 
                 // Equality conditions
-                $match = true;
                 foreach ($parsed['conditions'] as $col => $expected) {
                     if (($data[$col] ?? null) !== $expected
                         && (string)($data[$col] ?? '') !== (string)$expected) {
@@ -2242,20 +2824,11 @@ namespace HtmlDatabase\Parser {
                     }
                 }
 
-                // LIKE conditions (SQL % → regex .*, _ → regex .)
+                // LIKE conditions (SQL % → regex .*, _ → regex ., \ escapes honored)
                 if ($match) {
                     foreach ($parsed['likeConditions'] as $col => $pattern) {
                         $val = (string)($data[$col] ?? '');
-                        // Build regex: escape everything, then convert SQL wildcards
-                        $escaped = '';
-                        $len = strlen($pattern);
-                        for ($i = 0; $i < $len; $i++) {
-                            $ch = $pattern[$i];
-                            if ($ch === '%') { $escaped .= '.*'; }
-                            elseif ($ch === '_') { $escaped .= '.'; }
-                            else { $escaped .= preg_quote($ch, '/'); }
-                        }
-                        if (!preg_match('/^' . $escaped . '$/is', $val)) {
+                        if (!preg_match('/^' . $this->likeToRegex($pattern) . '$/is', $val)) {
                             $match = false;
                             break;
                         }
@@ -2266,15 +2839,7 @@ namespace HtmlDatabase\Parser {
                 if ($match) {
                     foreach ($parsed['notLikeConditions'] as $col => $pattern) {
                         $val = (string)($data[$col] ?? '');
-                        $escaped = '';
-                        $len = strlen($pattern);
-                        for ($i = 0; $i < $len; $i++) {
-                            $ch = $pattern[$i];
-                            if ($ch === '%') { $escaped .= '.*'; }
-                            elseif ($ch === '_') { $escaped .= '.'; }
-                            else { $escaped .= preg_quote($ch, '/'); }
-                        }
-                        if (preg_match('/^' . $escaped . '$/is', $val)) {
+                        if (preg_match('/^' . $this->likeToRegex($pattern) . '$/is', $val)) {
                             $match = false;
                             break;
                         }
@@ -2301,31 +2866,131 @@ namespace HtmlDatabase\Parser {
                     }
                 }
 
+                // OR groups: mixed-column disjunctions, at least one must pass
+                if ($match && !empty($parsed['orGroups'])) {
+                    foreach ($parsed['orGroups'] as $group) {
+                        $any = false;
+                        foreach ($group as $cond) {
+                            if ($cond[0] === 'eq') {
+                                if ((string)($data[$cond[1]] ?? '') === (string)$cond[2]) { $any = true; break; }
+                            } elseif ($cond[0] === 'cmp') {
+                                $val = $data[$cond[1]] ?? '';
+                                $cv  = $cond[3];
+                                if (is_numeric($val) && is_numeric($cv)) { $v = (float)$val; $c = (float)$cv; }
+                                else { $v = (string)$val; $c = (string)$cv; }
+                                $ok = match ($cond[2]) {
+                                    '>'  => $v > $c,
+                                    '>=' => $v >= $c,
+                                    '<'  => $v < $c,
+                                    '<=' => $v <= $c,
+                                    default => false,
+                                };
+                                if ($ok) { $any = true; break; }
+                            }
+                        }
+                        if (!$any) { $match = false; break; }
+                    }
+                }
+
                 if ($match) {
                     $filtered[] = $data;
                 }
             }
 
-            // ORDER BY
-            if ($parsed['orderBy'] !== null && !empty($filtered)) {
-                $col = $parsed['orderBy'];
-                $dir = $parsed['orderDir'];
-                usort($filtered, function ($a, $b) use ($col, $dir) {
-                    $av = $a[$col] ?? '';
-                    $bv = $b[$col] ?? '';
-                    // Try numeric comparison first
-                    if (is_numeric($av) && is_numeric($bv)) {
-                        $cmp = (float)$av <=> (float)$bv;
-                    } else {
-                        $cmp = strcmp($av, $bv);
+            // GROUP BY: bucket rows, compute aggregates per bucket, HAVING
+            if (!empty($parsed['groupBy'])) {
+                $groups = [];
+                foreach ($filtered as $data) {
+                    $keyParts = [];
+                    foreach ($parsed['groupBy'] as $gc) { $keyParts[] = (string)($data[$gc] ?? ''); }
+                    $gk = implode("\x1F", $keyParts);
+                    if (!isset($groups[$gk])) { $groups[$gk] = ['first' => $data, 'rows' => []]; }
+                    $groups[$gk]['rows'][] = $data;
+                }
+                $grouped = [];
+                foreach ($groups as $g) {
+                    $row = [];
+                    foreach ($parsed['groupBy'] as $gc) { $row[$gc] = $g['first'][$gc] ?? ''; }
+                    foreach ($parsed['aggregates'] as $ag) {
+                        $row[$ag['alias']] = $this->computeAggregate($ag, $g['rows']);
                     }
-                    return $dir === 'DESC' ? -$cmp : $cmp;
+                    $keep = true;
+                    foreach ($parsed['having'] as $h) {
+                        if (!array_key_exists($h['col'], $row)) { $keep = false; break; }
+                        $v = $row[$h['col']];
+                        $c = $h['val'];
+                        if (is_numeric($v) && is_numeric($c)) { $vv = (float)$v; $cc = (float)$c; }
+                        else { $vv = (string)$v; $cc = (string)$c; }
+                        $pass = match ($h['op']) {
+                            '>'  => $vv > $cc,
+                            '>=' => $vv >= $cc,
+                            '<'  => $vv < $cc,
+                            '<=' => $vv <= $cc,
+                            '='  => $vv == $cc,
+                            '!=' => $vv != $cc,
+                            '<>' => $vv != $cc,
+                            default => true,
+                        };
+                        if (!$pass) { $keep = false; break; }
+                    }
+                    if ($keep) $grouped[] = $row;
+                }
+                $filtered = $grouped;
+            }
+
+            // ORDER BY (multi-column)
+            if (!empty($parsed['orderBy']) && !empty($filtered)) {
+                $orderSpec = $parsed['orderBy'];
+                usort($filtered, function ($a, $b) use ($orderSpec) {
+                    foreach ($orderSpec as $term) {
+                        $col = $term['col'];
+                        $av  = $a[$col] ?? '';
+                        $bv  = $b[$col] ?? '';
+                        if (is_numeric($av) && is_numeric($bv)) {
+                            $cmp = (float)$av <=> (float)$bv;
+                        } else {
+                            $cmp = strcmp((string)$av, (string)$bv);
+                        }
+                        if ($cmp !== 0) {
+                            return $term['dir'] === 'DESC' ? -$cmp : $cmp;
+                        }
+                    }
+                    return 0;
                 });
             }
 
             // Save total count before LIMIT for SQL_CALC_FOUND_ROWS
             if ($parsed['calcFoundRows'] ?? false) {
                 $this->calcFoundRows = count($filtered);
+            }
+
+            // Aggregates without GROUP BY: collapse to a single row
+            if (!empty($parsed['aggregates']) && empty($parsed['groupBy'])) {
+                $aggRow = [];
+                foreach ($parsed['aggregates'] as $ag) {
+                    $aggRow[$ag['alias']] = $this->computeAggregate($ag, $filtered);
+                }
+                return [(object) $aggRow];
+            }
+
+            // DISTINCT over projected columns (grouped rows are unique already)
+            if (!empty($parsed['distinct']) && empty($parsed['groupBy'])) {
+                $star     = in_array('*', $parsed['columns'], true);
+                $seenKeys = [];
+                $unique   = [];
+                foreach ($filtered as $data) {
+                    $parts = [];
+                    foreach ($data as $col => $val) {
+                        if ($star || in_array($col, $parsed['columns'], true)) {
+                            $parts[] = (string) $val;
+                        }
+                    }
+                    $key = implode("\x1F", $parts);
+                    if (isset($seenKeys[$key])) continue;
+                    $seenKeys[$key] = true;
+                    $unique[] = $data;
+                }
+                $filtered = $unique;
             }
 
             // OFFSET + LIMIT
@@ -2335,21 +3000,151 @@ namespace HtmlDatabase\Parser {
                 $filtered = array_slice($filtered, $offset, $length);
             }
 
-            // Project columns
+            // Project columns. Requested-but-absent columns are filled with ''
+            // so callers never hit "Undefined property" on partial rows.
+            $star = in_array('*', $parsed['columns'], true);
             $results = [];
             foreach ($filtered as $data) {
                 $projected = [];
                 foreach ($data as $col => $val) {
-                    if (in_array('*', $parsed['columns'], true)
-                        || in_array($col, $parsed['columns'], true)) {
-                        // Serialization safety: decode HTML entities + strip slashes
+                    if ($star || in_array($col, $parsed['columns'], true)) {
                         $projected[$col] = $val;
+                    }
+                }
+                if (!$star) {
+                    foreach ($parsed['columns'] as $col) {
+                        if (!array_key_exists($col, $projected) && $col !== '') {
+                            $projected[$col] = '';
+                        }
                     }
                 }
                 $results[] = (object) $projected;
             }
 
             return $results;
+        }
+
+        /**
+         * Walk the join graph from the main row down to the given alias,
+         * returning every reachable joined row.
+         */
+        private function resolveJoinRows(string $alias, array $mainRow, string $mainAlias, array $joinIndex): array
+        {
+            if ($alias === $mainAlias || !isset($joinIndex[$alias])) {
+                return [$mainRow];
+            }
+            $spec       = $joinIndex[$alias]['spec'];
+            $parentRows = $this->resolveJoinRows($spec['parent'], $mainRow, $mainAlias, $joinIndex);
+            $out = [];
+            foreach ($parentRows as $pr) {
+                $key = (string)($pr[$spec['parentCol']] ?? '');
+                foreach ($joinIndex[$alias]['idx'][$key] ?? [] as $crow) {
+                    $out[] = $crow;
+                }
+            }
+            return $out;
+        }
+
+        /**
+         * Evaluate one operator condition against a joined row.
+         */
+        private function joinFilterMatch(array $row, array $jf): bool
+        {
+            $val = (string)($row[$jf['col']] ?? '');
+            switch ($jf['op']) {
+                case 'eq':      return $val === (string)$jf['vals'][0];
+                case 'ne':      return $val !== (string)$jf['vals'][0];
+                case 'in':      return in_array($val, array_map('strval', $jf['vals']), true);
+                case 'not_in':  return !in_array($val, array_map('strval', $jf['vals']), true);
+                case 'like':    return (bool)preg_match('/^' . $this->likeToRegex($jf['vals'][0]) . '$/is', $val);
+                case 'not_like': return !preg_match('/^' . $this->likeToRegex($jf['vals'][0]) . '$/is', $val);
+                case '>': case '>=': case '<': case '<=':
+                    $c = $jf['vals'][0];
+                    if (is_numeric($val) && is_numeric($c)) { $v = (float)$val; $cc = (float)$c; }
+                    else { $v = $val; $cc = (string)$c; }
+                    return (bool)match ($jf['op']) {
+                        '>'  => $v > $cc,
+                        '>=' => $v >= $cc,
+                        '<'  => $v < $cc,
+                        '<=' => $v <= $cc,
+                    };
+            }
+            return true;
+        }
+
+        /**
+         * Compile a SQL LIKE pattern to a regex, honoring \% \_ \\ escapes.
+         */
+        private function likeToRegex(string $pattern): string
+        {
+            $escaped = '';
+            $len = strlen($pattern);
+            for ($i = 0; $i < $len; $i++) {
+                $ch = $pattern[$i];
+                if ($ch === '\\' && $i + 1 < $len
+                    && in_array($pattern[$i + 1], ['%', '_', '\\'], true)) {
+                    $escaped .= preg_quote($pattern[$i + 1], '/');
+                    $i++;
+                } elseif ($ch === '%') {
+                    $escaped .= '.*';
+                } elseif ($ch === '_') {
+                    $escaped .= '.';
+                } else {
+                    $escaped .= preg_quote($ch, '/');
+                }
+            }
+            return $escaped;
+        }
+
+        /**
+         * Compute one aggregate over the filtered row set.
+         */
+        private function computeAggregate(array $ag, array $rows): string
+        {
+            $fn = $ag['fn'];
+            if ($fn === 'COUNT') {
+                if ($ag['col'] === '*') {
+                    return (string) count($rows);
+                }
+                $n = 0;
+                $seen = [];
+                foreach ($rows as $r) {
+                    $v = $r[$ag['col']] ?? null;
+                    if ($v === null || $v === '') continue;
+                    if ($ag['distinct']) {
+                        $k = (string)$v;
+                        if (isset($seen[$k])) continue;
+                        $seen[$k] = true;
+                    }
+                    $n++;
+                }
+                return (string) $n;
+            }
+
+            $vals = [];
+            foreach ($rows as $r) {
+                $v = $r[$ag['col']] ?? null;
+                if ($v === null || $v === '') continue;
+                $vals[] = $v;
+            }
+            if (empty($vals)) return '';
+
+            $allNumeric = true;
+            foreach ($vals as $v) {
+                if (!is_numeric($v)) { $allNumeric = false; break; }
+            }
+
+            return match ($fn) {
+                'MAX'   => $allNumeric
+                            ? (string) max(array_map('floatval', $vals))
+                            : max($vals),
+                'MIN'   => $allNumeric
+                            ? (string) min(array_map('floatval', $vals))
+                            : min($vals),
+                'SUM'   => (string) array_sum(array_map('floatval', $vals)),
+                'AVG'   => (string) (array_sum(array_map('floatval', $vals)) / count($vals)),
+                default => '',
+            };
         }
 
     }
@@ -2418,11 +3213,46 @@ namespace HtmlDatabase\Parser {
         {
             $expr = trim($expr);
             if ($expr === '') return;
+
+            // col = 'value'
             if (preg_match('/^([a-zA-Z0-9_]+)\s*=\s*[\'"](.*)[\'"]$/s', $expr, $m)) {
                 $pairs[$m[1]] = stripslashes($m[2]);
-            } elseif (preg_match('/^([a-zA-Z0-9_]+)\s*=\s*(.+)$/s', $expr, $m)) {
-                $pairs[$m[1]] = trim($m[2]);
+                return;
             }
+
+            $rhs = null;
+            if (preg_match('/^([a-zA-Z0-9_]+)\s*=\s*(.+)$/s', $expr, $m)) {
+                $col = $m[1];
+                $rhs = trim($m[2]);
+            }
+            if ($rhs === null) return;
+
+            // NULL literal
+            if (strcasecmp($rhs, 'NULL') === 0) { $pairs[$col] = ''; return; }
+
+            // Date/time functions evaluated at write time
+            if (preg_match('/^(NOW|CURRENT_TIMESTAMP|CURRENT_TIMESTAMP\(\)|CURRENT_DATE|CURDATE)\b\(*$/i', $rhs)) {
+                $pairs[$col] = gmdate('Y-m-d H:i:s');
+                return;
+            }
+            if (preg_match('/^UNIX_TIMESTAMP\(\s*\)$/i', $rhs)) {
+                $pairs[$col] = (string) time();
+                return;
+            }
+
+            // Arithmetic on the existing column: col = col + N | col - N
+            if (preg_match('/^([a-zA-Z0-9_]+)\s*([+\-])\s*(\d+(?:\.\d+)?)$/', $rhs, $am)
+                && $am[1] === $col) {
+                $delta = (float) $am[3] * ($am[2] === '-' ? -1 : 1);
+                $pairs[$col] = ['__delta__' => $delta];
+                return;
+            }
+
+            // Bare number
+            if (is_numeric($rhs)) { $pairs[$col] = $rhs; return; }
+
+            // Anything else: store as-is (best effort)
+            $pairs[$col] = stripslashes($rhs);
         }
 
         private function parseWhereEquality(string $clause): array
@@ -2436,6 +3266,22 @@ namespace HtmlDatabase\Parser {
             foreach ($parts as $part) {
                 $part = trim($part);
                 if (preg_match('/^\d+\s*=\s*\d+$/', $part)) continue;
+
+                // col IN ('a','b') / col IN (1,2)
+                if (preg_match('/^([a-zA-Z0-9_]+)\s+IN\s*\((.+)\)$/i', $part, $m)) {
+                    $vals = $this->parseInList($m[2]);
+                    if (!empty($vals)) {
+                        $conditions[$m[1]] = ['__in__' => $vals];
+                    }
+                    continue;
+                }
+
+                // col > / >= / < / <= value (numeric or quoted)
+                if (preg_match('/^([a-zA-Z0-9_]+)\s*(>=|<=|>|<)\s*(\'[^\']*\'|"[^"]*"|-?\d+(?:\.\d+)?)$/s', $part, $m)) {
+                    $conditions[$m[1]] = ['__cmp__' => [trim($m[3], "'\""), $m[2]]];
+                    continue;
+                }
+
                 if (preg_match('/([a-zA-Z0-9_]+)\s*=\s*[\'"](.*?)[\'"]/', $part, $m)) {
                     $conditions[$m[1]] = $m[2];
                     continue;
@@ -2445,6 +3291,36 @@ namespace HtmlDatabase\Parser {
                 }
             }
             return $conditions;
+        }
+
+        /** Tokenize an IN(...) value list: quoted strings and bare numbers. */
+        private function parseInList(string $raw): array
+        {
+            $vals  = [];
+            $buf   = '';
+            $inStr = false;
+            $quote = '';
+            $len   = strlen($raw);
+            for ($i = 0; $i < $len; $i++) {
+                $ch = $raw[$i];
+                if ($inStr) {
+                    if ($ch === '\\' && $i + 1 < $len) { $buf .= $raw[++$i]; continue; }
+                    if ($ch === $quote) { $inStr = false; continue; }
+                    $buf .= $ch;
+                    continue;
+                }
+                if ($ch === "'" || $ch === '"') { $inStr = true; $quote = $ch; continue; }
+                if ($ch === ',') {
+                    $t = trim($buf);
+                    if ($t !== '') $vals[] = $t;
+                    $buf = '';
+                    continue;
+                }
+                $buf .= $ch;
+            }
+            $t = trim($buf);
+            if ($t !== '') $vals[] = $t;
+            return $vals;
         }
     }
 }
@@ -2460,15 +3336,17 @@ namespace {
     use HtmlDatabase\Parser\MutationParser;
     use HtmlDatabase\Parser\SqlToXpathTranslator;
 
+    // The drop-in is loaded by wp-db.php before class wpdb itself is defined.
+    if (!class_exists('wpdb', false)) {
+        require_once ABSPATH . WPINC . '/class-wpdb.php';
+    }
+
     class HtmlDatabase_WPDB extends wpdb
     {
         private ShardedStorageManager $storage;
         private SqlToXpathTranslator  $translator;
         private InsertTokenizer       $insertTokenizer;
         private MutationParser        $mutationParser;
-
-        /** Per-request TX counter (used as fallback, prefer global TX). */
-        private int $txCounter = 0;
 
         public function __construct(
             mixed $dbuser,
@@ -2478,7 +3356,9 @@ namespace {
         ) {
             $this->show_errors();
 
-            $storagePath = WP_CONTENT_DIR . '/html_db';
+            $storagePath = defined('HTMLDB_BASE_PATH')
+                ? HTMLDB_BASE_PATH
+                : WP_CONTENT_DIR . '/html_db';
             $config      = new Configuration($storagePath);
 
             $this->storage         = new ShardedStorageManager($config);
@@ -2524,7 +3404,10 @@ namespace {
 
         public function has_cap($db_cap)
         {
-            $supported = ['collation', 'group_concat', 'subqueries', 'set_charset', 'utf8mb4'];
+            // Only advertise what is genuinely implemented. group_concat and
+            // subqueries are NOT supported; WP falls back to slower but
+            // correct PHP-side paths when these report false.
+            $supported = ['collation', 'set_charset', 'utf8mb4'];
             return is_string($db_cap) && in_array(strtolower($db_cap), $supported, true);
         }
 
@@ -2544,7 +3427,6 @@ namespace {
 
             $this->last_query = $query;
             $this->num_queries++;
-            $this->txCounter++;
 
             $clean = trim($query);
             $verb  = strtoupper(strtok($clean, " \t\n\r"));
@@ -2556,7 +3438,8 @@ namespace {
                     'UPDATE' => $this->handleUpdate($clean),
                     'DELETE' => $this->handleDelete($clean),
                     'REPLACE' => $this->handleReplace($clean),
-                    'CREATE', 'ALTER', 'DROP', 'TRUNCATE' => $this->handleDdl($clean),
+                    'CREATE', 'ALTER' => $this->handleDdl($clean),
+                    'DROP', 'TRUNCATE' => $this->handleDropTruncate($clean),
                     'SET', 'START', 'COMMIT', 'ROLLBACK', 'SAVEPOINT', 'RELEASE' => true,
                     'SHOW'   => $this->handleShow($clean),
                     'DESCRIBE', 'DESC' => $this->handleDescribe($clean),
@@ -2588,15 +3471,29 @@ namespace {
                 return 1;
             }
 
-            // YEAR() / MONTH() aggregate: SELECT DISTINCT YEAR(col) AS y, MONTH(col) AS m FROM ...
-            if (preg_match('/\bYEAR\s*\(/i', $sql) || preg_match('/\bMONTH\s*\(/i', $sql)) {
+            // SELECT VERSION()
+            if (preg_match('/SELECT\s+VERSION\s*\(\s*\)/i', $sql)) {
+                $this->last_result = [(object) ['VERSION()' => $this->db_server_info()]];
+                $this->num_rows = 1;
+                return 1;
+            }
+
+            // SELECT <literal> (no FROM): e.g. health checks "SELECT 1"
+            if (!preg_match('/\bFROM\b/i', $sql)
+                && preg_match('/^SELECT\s+(-?\d+(?:\.\d+)?|\'[^\']*\'|"[^"]*")\s*;?\s*$/is', $sql, $lm)) {
+                $val = trim($lm[1], "'\"");
+                $this->last_result = [(object) [$lm[1] => $val]];
+                $this->num_rows = 1;
+                return 1;
+            }
+
+            // YEAR() / MONTH() / DAY() aggregate: SELECT DISTINCT YEAR(col) AS y, MONTH(col) AS m FROM ...
+            if (preg_match('/\b(YEAR|MONTH|DAY)\s*\(/i', $sql)) {
                 return $this->handleDateFunctions($sql);
             }
 
-            // GROUP BY + COUNT(*)
-            if (preg_match('/GROUP\s+BY/i', $sql) && preg_match('/COUNT\s*\(\s*\*\s*\)/i', $sql)) {
-                return $this->handleGroupByCount($sql);
-            }
+            // GROUP BY + COUNT(*) — handled natively by the translator now
+            // (fan-out joins, HAVING, multi-aggregates).
 
             // UNION
             if (preg_match('/\bUNION\b/i', $sql)) {
@@ -2624,8 +3521,19 @@ namespace {
                 return 0;
             }
 
-            // Strip date functions and DISTINCT, replace with SELECT * to get all rows
+            // Strip date functions and DISTINCT, replace with SELECT * to get all rows.
+            // LIMIT is lifted off the inner query and re-applied after the
+            // DISTINCT collapse, matching MySQL semantics.
             $stripped = preg_replace('/SELECT\s+(DISTINCT\s+)?.*?\s+FROM/is', 'SELECT * FROM', $sql);
+            $limit = null;
+            $offset = 0;
+            if (preg_match('/LIMIT\s+(\d+)\s*,\s*(\d+)/i', $stripped, $x)) {
+                $offset = (int)$x[1]; $limit = (int)$x[2];
+                $stripped = preg_replace('/\s*LIMIT\s+\d+\s*,\s*\d+\s*$/i', '', $stripped);
+            } elseif (preg_match('/LIMIT\s+(\d+)/i', $stripped, $x)) {
+                $limit = (int)$x[1];
+                $stripped = preg_replace('/\s*LIMIT\s+\d+\s*$/i', '', $stripped);
+            }
             $rows = $this->translator->executeSelect($stripped);
 
             // Build unique combinations
@@ -2669,6 +3577,10 @@ namespace {
 
             // ORDER BY — inherit from parsed SQL (typically ORDER BY post_date DESC)
             // Results are already grouped, just preserve the order they appeared.
+
+            if ($limit !== null || $offset > 0) {
+                $results = array_slice($results, $offset, $limit ?? count($results));
+            }
 
             $this->last_result = $results;
             $this->num_rows    = count($results);
@@ -2757,13 +3669,22 @@ namespace {
                 }
             }
 
-            // Simple UNION
+            // Simple UNION — plain UNION deduplicates, UNION ALL does not
+            $isAll = (bool) preg_match('/\bUNION\s+ALL\b/i', $sql);
             $parts = preg_split('/\bUNION\s+(ALL\s+)?/i', $sql);
             $allRows = [];
+            $seen = [];
             foreach ($parts as $part) {
                 $part = trim($part);
                 if (stripos($part, 'SELECT') === 0) {
-                    foreach ($this->translator->executeSelect($part) as $r) $allRows[] = $r;
+                    foreach ($this->translator->executeSelect($part) as $r) {
+                        if (!$isAll) {
+                            $k = serialize($r);
+                            if (isset($seen[$k])) continue;
+                            $seen[$k] = true;
+                        }
+                        $allRows[] = $r;
+                    }
                 }
             }
             $this->last_result = $allRows;
@@ -2837,6 +3758,7 @@ namespace {
             $table   = $parsed['table'];
             $columns = $parsed['columns'];
             $rows    = $parsed['rows'];
+            $onDup   = $parsed['onDuplicate'] ?? null;
 
             // URL Safeguard
             $rows = $this->applySiteurlSafeguard($table, $columns, $rows);
@@ -2867,8 +3789,57 @@ namespace {
                 unset($row);
             } elseif ($pkCol !== null) {
                 $pkIdx = array_search($pkCol, $columns, true);
-                if ($pkIdx !== false && isset($rows[0][$pkIdx])) {
-                    $firstGeneratedId = (int) $rows[0][$pkIdx];
+                if ($pkIdx !== false) {
+                    $maxPk = 0;
+                    foreach ($rows as $r) {
+                        if (isset($r[$pkIdx]) && (int) $r[$pkIdx] > $maxPk) {
+                            $maxPk = (int) $r[$pkIdx];
+                        }
+                    }
+                    $firstGeneratedId = $maxPk;
+                    // Keep the sequence ahead of explicit IDs so future
+                    // auto-increments never collide.
+                    if ($maxPk > 0) {
+                        $this->storage->advanceSequence($table, $maxPk);
+                    }
+                }
+            }
+
+            // ON DUPLICATE KEY UPDATE: rows whose PK already exists are
+            // updated with the duplicate clause instead of inserted.
+            if ($onDup !== null && $pkCol !== null) {
+                $pkIdx = array_search($pkCol, $columns, true);
+                $insertRows = [];
+                $affected = 0;
+                foreach ($rows as $row) {
+                    $pk = (string) ($row[$pkIdx] ?? '');
+                    $existing = $pk !== ''
+                        ? $this->storage->findRowByPk($table, $pk)
+                        : null;
+                    if ($existing !== null) {
+                        $setValues = [];
+                        foreach ($onDup as $col => $expr) {
+                            if (preg_match('/^VALUES\(\s*([a-zA-Z0-9_]+)\s*\)$/i', $expr, $vm)) {
+                                $srcIdx = array_search($vm[1], $columns, true);
+                                $setValues[$col] = $srcIdx !== false ? (string) ($row[$srcIdx] ?? '') : '';
+                            } elseif (preg_match('/^([a-zA-Z0-9_]+)\s*\+\s*(\d+(?:\.\d+)?)$/', $expr, $dm)
+                                && $dm[1] === $col) {
+                                $setValues[$col] = ['__delta__' => (float) $dm[2]];
+                            } elseif (strcasecmp($expr, 'VALUES') !== 0) {
+                                $setValues[$col] = trim($expr, "'\"");
+                            }
+                        }
+                        $tx = $this->storage->nextTxId();
+                        $affected += $this->storage->updateRowsByPk($table, $pk, $setValues, $tx);
+                    } else {
+                        $insertRows[] = $row;
+                    }
+                }
+                $rows = $insertRows;
+                if (empty($rows)) {
+                    $this->rows_affected = $affected > 0 ? $affected : 0;
+                    $this->insert_id = $firstGeneratedId;
+                    return $this->rows_affected;
                 }
             }
 
@@ -2882,7 +3853,7 @@ namespace {
                 $this->rows_affected = $this->storage->insertBatch($table, $columns, $rows, $txId);
             }
 
-            $this->insert_id = $firstGeneratedId ?: $this->txCounter;
+            $this->insert_id = $firstGeneratedId;
             return $this->rows_affected;
         }
 
@@ -2890,8 +3861,26 @@ namespace {
 
         private function handleReplace(string $sql): int|false
         {
+            // REPLACE = delete conflicting row, then insert. Convert the
+            // statement and pre-delete the PKs it carries.
             $converted = preg_replace('/^REPLACE\s+/i', 'INSERT ', $sql);
-            return $this->handleInsert($converted);
+            $parsed = $this->insertTokenizer->tokenize((string) $converted);
+            if ($parsed !== null) {
+                $pkCol = $this->resolveAutoPkColumn($parsed['table']);
+                if ($pkCol !== null) {
+                    $pkIdx = array_search($pkCol, $parsed['columns'], true);
+                    if ($pkIdx !== false) {
+                        $tx = $this->storage->nextTxId();
+                        foreach ($parsed['rows'] as $row) {
+                            $pk = (string) ($row[$pkIdx] ?? '');
+                            if ($pk !== '') {
+                                $this->storage->deleteRowsByPk($parsed['table'], $pk, $tx);
+                            }
+                        }
+                    }
+                }
+            }
+            return $this->handleInsert((string) $converted);
         }
 
         // -- UPDATE -----------------------------------------------------------
@@ -2928,12 +3917,43 @@ namespace {
 
         private function handleDdl(string $sql): bool { return true; }
 
+        /**
+         * DROP TABLE / TRUNCATE TABLE must actually remove data, otherwise
+         * re-created tables resurrect stale rows.
+         */
+        private function handleDropTruncate(string $sql): bool
+        {
+            if (preg_match('/^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(.+)$/is', trim($sql), $m)) {
+                foreach (explode(',', $m[1]) as $t) {
+                    $t = trim($t, " \t\n\r`;");
+                    if ($t !== '') $this->storage->dropTable($t);
+                }
+                return true;
+            }
+            if (preg_match('/^TRUNCATE\s+(?:TABLE\s+)?([a-zA-Z0-9_]+)/is', trim($sql), $m)) {
+                $this->storage->truncateTable($m[1]);
+                return true;
+            }
+            if (preg_match('/^DROP\s+DATABASE/i', trim($sql))) {
+                return true; // never nuke the whole storage root
+            }
+            return true;
+        }
+
         // -- SHOW / DESCRIBE --------------------------------------------------
 
         private function handleShow(string $sql): int
         {
             $this->last_result = [];
             $this->num_rows    = 0;
+
+            if (preg_match('/SHOW\s+COLUMNS\s+FROM\s+([a-zA-Z0-9_]+)/i', $sql, $cm)) {
+                $cols = $this->storage->listColumns($cm[1]);
+                foreach ($cols as $col) {
+                    $this->last_result[] = (object) ['Field' => $col, 'Type' => 'longtext', 'Null' => 'YES', 'Key' => '', 'Default' => null, 'Extra' => ''];
+                }
+                $this->num_rows = count($this->last_result);
+            }
 
             if (preg_match('/SHOW\s+TABLES/i', $sql)) {
                 $likePattern = null;
