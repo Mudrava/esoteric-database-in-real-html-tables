@@ -47,6 +47,12 @@ namespace HtmlDatabase\Core {
         /** Number of WAL entries before inline compaction triggers. */
         public readonly int $compactThreshold;
 
+        /** 32-byte AES key for secret columns (user_pass). */
+        public readonly string $secretKey;
+
+        /** When false the storage directory is web-denied (default). */
+        public readonly bool $browse;
+
         public function __construct(
             public string $basePath,
             int           $chunkSize        = 500,
@@ -54,6 +60,34 @@ namespace HtmlDatabase\Core {
         ) {
             $this->chunkSize        = $chunkSize;
             $this->compactThreshold = $compactThreshold;
+            $this->browse           = \defined('HTMLDB_BROWSE') && HTMLDB_BROWSE === true;
+            $this->secretKey        = $this->resolveSecretKey();
+        }
+
+        /**
+         * Resolve the AES key: an explicit HTMLDB_SECRET_KEY constant wins,
+         * otherwise a per-install key is persisted in a dot-file (web-denied)
+         * and reused across requests.
+         */
+        private function resolveSecretKey(): string
+        {
+            if (\defined('HTMLDB_SECRET_KEY')) {
+                return hash('sha256', (string) HTMLDB_SECRET_KEY, true);
+            }
+            $keyFile = $this->basePath . '/.secret';
+            if (is_readable($keyFile)) {
+                $raw = (string) @file_get_contents($keyFile);
+                $bin = @base64_decode(trim($raw), true);
+                if (is_string($bin) && strlen($bin) === 32) {
+                    return $bin;
+                }
+            }
+            $key = random_bytes(32);
+            if (is_dir($this->basePath) || @mkdir($this->basePath, 0755, true)) {
+                @file_put_contents($keyFile, base64_encode($key));
+                @chmod($keyFile, 0600);
+            }
+            return $key;
         }
     }
 
@@ -1219,6 +1253,60 @@ HTML;
         // -- Private helpers --------------------------------------------------
 
         /**
+         * Columns whose values are encrypted at rest. WordPress never filters
+         * on these in SQL (passwords are verified in PHP via
+         * wp_check_password), so ciphertext in the HTML is transparent to the
+         * query engine while keeping the browsable files safe to expose.
+         */
+        private const SECRET_COLUMNS = ['user_pass'];
+
+        private function isSecretColumn(string $col): bool
+        {
+            return in_array($col, self::SECRET_COLUMNS, true);
+        }
+
+        /**
+         * Encrypt a secret column value with AES-256-GCM. Output is
+         * "enc:v1:base64(iv|tag|ciphertext)". Non-secret, empty, or already
+         * encrypted values pass through untouched.
+         */
+        private function encryptSecret(string $value): string
+        {
+            if ($value === '' || str_starts_with($value, 'enc:v1:')) {
+                return $value;
+            }
+            $iv  = random_bytes(12);
+            $tag = '';
+            $ct  = openssl_encrypt($value, 'aes-256-gcm', $this->config->secretKey,
+                OPENSSL_RAW_DATA, $iv, $tag, '', 16);
+            if ($ct === false) {
+                return $value;
+            }
+            return 'enc:v1:' . base64_encode($iv . $tag . $ct);
+        }
+
+        /**
+         * Reverse encryptSecret. Values without the enc:v1: prefix (legacy
+         * plaintext rows) are returned unchanged.
+         */
+        private function decryptSecret(string $value): string
+        {
+            if (!str_starts_with($value, 'enc:v1:')) {
+                return $value;
+            }
+            $raw = base64_decode(substr($value, 7), true);
+            if ($raw === false || strlen($raw) < 29) {
+                return '';
+            }
+            $iv  = substr($raw, 0, 12);
+            $tag = substr($raw, 12, 16);
+            $ct  = substr($raw, 28);
+            $pt  = openssl_decrypt($ct, 'aes-256-gcm', $this->config->secretKey,
+                OPENSSL_RAW_DATA, $iv, $tag);
+            return $pt === false ? '' : $pt;
+        }
+
+        /**
          * Build an MVCC WAL entry with operation type and PK.
          */
         private function buildWalEntry(array $payload, string $op, int $txId, string $pk): string
@@ -1231,7 +1319,11 @@ HTML;
             );
             foreach ($payload as $column => $value) {
                 $safeCol = htmlspecialchars((string) $column, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                $safeVal = htmlspecialchars((string) $value,  ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                $rawVal  = (string) $value;
+                if ($this->isSecretColumn((string) $column)) {
+                    $rawVal = $this->encryptSecret($rawVal);
+                }
+                $safeVal = htmlspecialchars($rawVal, ENT_QUOTES | ENT_HTML5, 'UTF-8');
                 $html .= sprintf('<td data-column="%s">%s</td>', $safeCol, $safeVal);
             }
             $html .= "</tr>\n";
@@ -1246,7 +1338,11 @@ HTML;
             $html = sprintf('<tr data-tx="%d">', $tx);
             foreach ($payload as $column => $value) {
                 $safeCol = htmlspecialchars((string) $column, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                $safeVal = htmlspecialchars((string) $value,  ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                $rawVal  = (string) $value;
+                if ($this->isSecretColumn((string) $column)) {
+                    $rawVal = $this->encryptSecret($rawVal);
+                }
+                $safeVal = htmlspecialchars($rawVal, ENT_QUOTES | ENT_HTML5, 'UTF-8');
                 $html .= sprintf('<td data-column="%s">%s</td>', $safeCol, $safeVal);
             }
             $html .= "</tr>\n";
@@ -1399,8 +1495,12 @@ HTML;
                 if ($valEnd === false) break;
 
                 $val = substr($trBlock, $valStart, $valEnd - $valStart);
-                $data[htmlspecialchars_decode($col, ENT_QUOTES | ENT_HTML5)]
-                    = htmlspecialchars_decode($val, ENT_QUOTES | ENT_HTML5);
+                $col = htmlspecialchars_decode($col, ENT_QUOTES | ENT_HTML5);
+                $val = htmlspecialchars_decode($val, ENT_QUOTES | ENT_HTML5);
+                if ($this->isSecretColumn($col)) {
+                    $val = $this->decryptSecret($val);
+                }
+                $data[$col] = $val;
 
                 $searchPos = $valEnd + 5;
             }
@@ -1730,21 +1830,24 @@ HTML;
                 mkdir($dir, 0755, true);
             }
 
-            // Security: .htaccess — serve the browsable pages, deny raw internals.
-            // NOTE: Apache-only. On nginx the whole directory is web-exposed by
-            // design of this experiment; deny it there via location block if needed.
+            // Security: .htaccess. Default is deny-all — the storage files
+            // (chunks, WAL) contain raw row data and must not be web-readable.
+            // Set HTMLDB_BROWSE=true in wp-config.php to expose the browsable
+            // HTML browser (index/chunk/WAL pages) for demos; internals stay
+            // denied either way. Apache-only: on nginx deny the directory via
+            // a location block.
             $htaccessPath = $dir . '/.htaccess';
-            if (!file_exists($htaccessPath)) {
-                file_put_contents($htaccessPath, implode("\n", [
-                    '# HtmlDB — browsable pages yes, raw internals no',
+            $htaccess = $this->config->browse
+                ? implode("\n", [
+                    '# HtmlDB — browse mode: pages yes, raw internals no',
                     '<IfModule mod_authz_core.c>',
-                    '    <FilesMatch "(^\\.|\\.tmp$|\\.lock$|^_meta\\.json$)">',
+                    '    <FilesMatch "(^\\.|\\.tmp$|\\.lock$|^_meta\\.json$|^_schema\\.json$|^_global\\.seq$)">',
                     '        Require all denied',
                     '    </FilesMatch>',
                     '    Require all granted',
                     '</IfModule>',
                     '<IfModule !mod_authz_core.c>',
-                    '    <FilesMatch "(^\\.|\\.tmp$|\\.lock$|^_meta\\.json$)">',
+                    '    <FilesMatch "(^\\.|\\.tmp$|\\.lock$|^_meta\\.json$|^_schema\\.json$|^_global\\.seq$)">',
                     '        Order allow,deny',
                     '        Deny from all',
                     '    </FilesMatch>',
@@ -1752,7 +1855,22 @@ HTML;
                     '    Allow from all',
                     '</IfModule>',
                     '',
-                ]));
+                ])
+                : implode("\n", [
+                    '# HtmlDB — storage is private by default.',
+                    '# Set HTMLDB_BROWSE=true in wp-config.php to enable the',
+                    '# browsable HTML database viewer.',
+                    '<IfModule mod_authz_core.c>',
+                    '    Require all denied',
+                    '</IfModule>',
+                    '<IfModule !mod_authz_core.c>',
+                    '    Order allow,deny',
+                    '    Deny from all',
+                    '</IfModule>',
+                    '',
+                ]);
+            if (!file_exists($htaccessPath) || (string) @file_get_contents($htaccessPath) !== $htaccess) {
+                file_put_contents($htaccessPath, $htaccess);
             }
 
             // Security: index.html
