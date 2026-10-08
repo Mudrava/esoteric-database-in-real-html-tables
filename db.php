@@ -319,7 +319,7 @@ namespace HtmlDatabase\Core {
     <nav>
       <a href="_index.html">⌂ Index</a> | {$nav}
     </nav>
-    <p class="info">Rows {$rowFrom}–{$rowTo} of {$totalRows} | Chunk size: {$this->config->chunkSize}</p>
+    <p class="info">Rows {$rowFrom}-{$rowTo} of {$totalRows} | Chunk size: {$this->config->chunkSize}</p>
   </header>
   <table id="{$table}">
     <thead>{$thead}</thead>
@@ -348,7 +348,7 @@ HTML;
             $chunkLinks = '';
             foreach ($chunks as $i => $chunkFile) {
                 $num   = $i + 1;
-                $range = (($num - 1) * $this->config->chunkSize + 1) . '–' . ($num * $this->config->chunkSize);
+                $range = (($num - 1) * $this->config->chunkSize + 1) . '-' . ($num * $this->config->chunkSize);
                 $chunkLinks .= "      <li><a href=\"{$chunkFile}\">Chunk {$num}</a> - rows {$range}</li>\n";
             }
 

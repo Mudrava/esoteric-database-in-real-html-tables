@@ -81,7 +81,7 @@ if (!class_exists('ACF')) {
     // Field values on a post, incl repeater (multi-row meta pattern)
     $post_id = wp_insert_post(['post_title' => 'T03 ACF post', 'post_status' => 'publish']);
     // update_metadata() unslashes its input (WP core contract), so callers
-    // must pass slashed data — exactly what the ACF UI does.
+    // must pass slashed data - exactly what the ACF UI does.
     update_post_meta($post_id, 't03_text', wp_slash('Hello ACF'));
     update_post_meta($post_id, 'field_t03_text', 'field_t03_text');
     update_post_meta($post_id, 't03_rep', 2);

@@ -21,8 +21,8 @@ html_db/
 └── wp_posts/
     ├── _index.html     ← table of contents (all chunks)
     ├── _meta.json      ← metadata (pk column, row count, …)
-    ├── chunk_0001.html ← rows 1–500 as an HTML table
-    ├── chunk_0002.html ← rows 501–1000
+    ├── chunk_0001.html ← rows 1-500 as an HTML table
+    ├── chunk_0002.html ← rows 501-1000
     ├── wal.html        ← append-only write-ahead log
     └── .seq            ← auto-increment counter
 ```
