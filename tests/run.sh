@@ -28,9 +28,13 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 
+# wp-cli runs as www-data, the same user Apache runs as. Running it as root
+# would create engine files (chunks, WAL, .seq) owned by root, and the web
+# server could no longer write them - core updates and option writes then
+# fail with EACCES. Same-user CLI keeps the whole storage consistent.
 wp() {
-    docker compose exec -T wp php /var/www/html/wp-content/htmldb-tests/wp-cli.phar \
-        "$@" --allow-root --path=/var/www/html
+    docker compose exec -T -u www-data wp php /var/www/html/wp-content/htmldb-tests/wp-cli.phar \
+        "$@" --path=/var/www/html
 }
 
 # First boot: install WordPress against the drop-in (MySQL container is only
@@ -55,7 +59,8 @@ for suite in t01_basic t02_content t03_plugins t04_ddl; do
     fi
 done
 
-# Apache runs as www-data; wp-cli runs as root. Keep the storage writable.
-docker compose exec -T wp chown -R www-data:www-data /var/www/html/wp-content/html_db
+# Safety net: if a previous run left root-owned files (older bench versions
+# ran wp-cli as root), hand the storage back to the web server user.
+docker compose exec -T wp chown -R www-data:www-data /var/www/html/wp-content/html_db 2>/dev/null || true
 
 exit $STATUS
