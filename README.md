@@ -145,12 +145,35 @@ Supported SQL surface (the subset WordPress core and popular plugins emit):
 
 ## Requirements
 
-- PHP 8.1+ (uses `readonly` classes and named arguments)
+- PHP 8.1+ (`readonly` properties, `match`, `str_starts_with`/`str_ends_with`)
 - WordPress 6.x
 - A POSIX-compatible filesystem (for `rename()` atomicity and `flock()`)
 
 ---
 
+## Tests
+
+A Docker bench with a real WordPress 6 (plus ACF and Elementor) runs the full
+suite against the engine:
+
+```bash
+./tests/run.sh        # all suites (88 checks)
+./tests/run.sh t02    # one suite
+```
+
+| Suite | Covers |
+|---|---|
+| `t01_basic` | CRUD, prepare, transients, cron, comments, arithmetic UPDATE |
+| `t02_content` | posts, taxonomies, menus, templates, UTF-8/emoji round-trip |
+| `t03_plugins` | ACF fields, Elementor data, REST API |
+| `t04_ddl` | CREATE/ALTER/DROP, DESCRIBE, SHOW TABLES, schema persistence |
+
+`bench_perf.php` / `bench_scale.php` measure insert throughput, PK-read
+latency and scan cost. The bench mounts `db.php` live, so engine edits are
+picked up without rebuilding the image.
+
+---
+
 ## License
 
-This project is provided as-is for educational and experimental purposes.
+MIT - see [LICENSE](LICENSE).

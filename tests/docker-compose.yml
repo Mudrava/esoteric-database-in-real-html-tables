@@ -1,0 +1,36 @@
+services:
+  db:
+    image: mariadb:10.11
+    environment:
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wp
+      MYSQL_PASSWORD: wpbench
+      MYSQL_ROOT_PASSWORD: rootbench
+    volumes:
+      - dbdata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh --connect --innodb_initialized"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  wp:
+    image: wordpress:6-php8.1-apache
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:80"
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wp
+      WORDPRESS_DB_PASSWORD: wpbench
+    volumes:
+      - wpdata:/var/www/html
+      - ../db.php:/var/www/html/wp-content/db.php
+      - .:/var/www/html/wp-content/htmldb-tests
+
+volumes:
+  dbdata:
+  wpdata:
